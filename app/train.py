@@ -9,17 +9,13 @@ from models.resnet_model import ResNet50
 from tqdm import tqdm
 import logging
 import urllib.request
-import tarfile
+import zipfile
+from torchsummary import summary  # Import the summary function
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Function to download the ImageNet dataset if it doesn't exist
-import os
-import logging
-import urllib.request
-import zipfile
-
 def download_imagenet_data(data_dir='path/to/imagenet'):
     if not os.path.exists(data_dir):
         os.makedirs(data_dir)
@@ -39,7 +35,6 @@ def download_imagenet_data(data_dir='path/to/imagenet'):
     else:
         logging.info("ImageNet dataset already exists. Skipping download.")
 
-
 def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
     # Check and download the ImageNet dataset
     download_imagenet_data()
@@ -57,7 +52,10 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
     # Initialize the model, loss function, and optimizer
-    model = ResNet50(num_classes=1000)  # Move model to GPU, removed cuda
+    model = ResNet50(num_classes=1000)  # Create the model
+    logging.info("Model Summary:")  # Log the model summary
+    summary(model, (3, 224, 224))  # Assuming input size is (3, 224, 224)
+    
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
@@ -69,7 +67,7 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
         total = 0
 
         for inputs, labels in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{num_epochs}'):
-            inputs, labels = inputs, labels  # Move data to GPU , removed cuda
+            inputs, labels = inputs, labels  # Move data to GPU, removed cuda
 
             # Zero the parameter gradients
             optimizer.zero_grad()
@@ -118,7 +116,7 @@ def test_model(model):
 
     with torch.no_grad():
         for inputs, labels in test_loader:
-            inputs, labels = inputs, labels # Move data to GPU, removed cuda
+            inputs, labels = inputs, labels  # Move data to GPU, removed cuda
             outputs = model(inputs)
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
