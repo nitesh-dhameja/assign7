@@ -16,7 +16,7 @@ from torchsummary import summary  # Import the summary function
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Function to download the ImageNet dataset if it doesn't exist
-def download_imagenet_data(data_dir='path/to/imagenet'):
+def download_imagenet_data(data_dir='/opt/dlami/nvme/path/to/imagenet'):
     if not os.path.exists(data_dir):
         os.makedirs(data_dir)
         logging.info("Downloading ImageNet dataset...")
@@ -48,11 +48,11 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
     ])
 
     # Load the ImageNet dataset (replace with your dataset path)
-    train_dataset = datasets.ImageFolder(root='path/to/imagenet/imagenet-mini/train', transform=transform)
+    train_dataset = datasets.ImageFolder(root='/opt/dlami/nvme/path/to/imagenet/imagenet-mini/train', transform=transform)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
     # Initialize the model, loss function, and optimizer
-    model = ResNet50(num_classes=1000)  # Create the model
+    model = ResNet50(num_classes=1000).to('cuda')  # Create the model, added cuda
     logging.info("Model Summary:")  # Log the model summary
     summary(model, (3, 224, 224))  # Assuming input size is (3, 224, 224)
     
@@ -67,7 +67,7 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
         total = 0
 
         for inputs, labels in tqdm(train_loader, desc=f'Epoch {epoch + 1}/{num_epochs}'):
-            inputs, labels = inputs, labels  # Move data to GPU, removed cuda
+            inputs, labels = inputs.to('cuda'), labels.to('cuda') # Move data to GPU, added cuda
 
             # Zero the parameter gradients
             optimizer.zero_grad()
@@ -108,7 +108,7 @@ def test_model(model):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-    test_dataset = datasets.ImageFolder(root='path/to/imagenet/imagenet-mini/val', transform=transform)
+    test_dataset = datasets.ImageFolder(root='/opt/dlami/nvme/path/to/imagenet/imagenet-mini/val', transform=transform)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
     correct = 0
@@ -116,7 +116,7 @@ def test_model(model):
 
     with torch.no_grad():
         for inputs, labels in test_loader:
-            inputs, labels = inputs, labels  # Move data to GPU, removed cuda
+            inputs, labels = inputs.to('cuda'), labels.to('cuda')  # Move data to GPU, added cuda
             outputs = model(inputs)
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
