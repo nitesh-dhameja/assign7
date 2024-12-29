@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.db
+*.DS_Store
+
+# Virtual environment
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Dataset
+app/path/
+app/path/to/imagenet/
+data/imagenet-mini/
+**/imagenet/
+**/imagenet-mini/
+
+# Environment variables and secrets
+.env
+*.env
+.env.*
+.aws/
+.aws/credentials
+.aws/config
+
+# Model checkpoints and logs
+logs/
+*.pth
+checkpoints/
+runs/
+wandb/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
