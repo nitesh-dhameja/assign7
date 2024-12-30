@@ -125,37 +125,52 @@ class S3ImageNetDataset(Dataset):
         file_idx = next(i for i, size in enumerate(self.cumulative_sizes[1:], 1) 
                        if idx < size) - 1
         local_idx = idx - self.cumulative_sizes[file_idx]
-        
-        try:
-            # Get the file
-            response = self.s3_client.get_object(
-                Bucket=self.bucket_name,
-                Key=self.arrow_files[file_idx]
-            )
-            
+
+
+        response = None
+        retries = 3
+        for _ in range(retries):
+            try:
+                # Get the file
+                response = self.s3_client.get_object(
+                    Bucket=self.bucket_name,
+                    Key=self.arrow_files[file_idx]
+                )
+                break  # Exit the loop if successful
+            except Exception as e:
+                logging.warning(f"Retrying due to error: {e}")
+
+        if response is None:
+            raise RuntimeError(f"Failed to fetch file {self.arrow_files[file_idx]} after {retries} retries")
+                
+        try:    
             # Read the file
             stream = pa.ipc.open_stream(response['Body'])
             
             # Skip to the correct batch
             current_idx = 0
             for batch in stream:
-                if batch is not None:
-                    batch_size = len(batch)
-                    if current_idx + batch_size > local_idx:
-                        # Found the correct batch
-                        record_idx = local_idx - current_idx
-                        image_data = batch['image'][record_idx]['bytes'].as_buffer()
-                        label = batch['label'][record_idx].as_py()
-                        
-                        # Convert to PIL Image
-                        image = Image.open(io.BytesIO(image_data)).convert('RGB')
-                        
-                        # Apply transforms
-                        if self.transform:
-                            image = self.transform(image)
-                        
-                        return image, label
-                    current_idx += batch_size
+                try:
+                    if batch is not None:
+                        batch_size = len(batch)
+                        if current_idx + batch_size > local_idx:
+                            # Found the correct batch
+                            record_idx = local_idx - current_idx
+                            image_data = batch['image'][record_idx]['bytes'].as_buffer()
+                            label = batch['label'][record_idx].as_py()
+                            
+                            # Convert to PIL Image
+                            image = Image.open(io.BytesIO(image_data)).convert('RGB')
+                            
+                            # Apply transforms
+                            if self.transform:
+                                image = self.transform(image)
+                            
+                            return image, label
+                        current_idx += batch_size
+                except Exception as e:
+                    logging.error(f"Error reading batch: {e}")
+                    continue  # Skip to the next batch if there's an error        
             
             raise ValueError(f"Could not find record at index {idx}")
             
@@ -243,7 +258,7 @@ def train_model(num_epochs=90, batch_size=256, learning_rate=0.1):
     model = ResNet50(num_classes=len(train_dataset.class_to_idx)).to(device)
     
     # Loss function and optimizer
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = optim.SGD(
         model.parameters(),
         lr=learning_rate,
