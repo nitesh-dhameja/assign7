@@ -16,6 +16,8 @@ from torchsummary import summary
 from datetime import datetime
 import pyarrow.parquet as pq
 import pyarrow as pa
+from torch.cuda.amp import GradScaler, autocast
+from transforms import Cutout  # Import the Cutout class
 
 # Load environment variables
 load_dotenv()
@@ -222,6 +224,7 @@ def train_model(num_epochs=90, batch_size=256, learning_rate=0.1):
         transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
+        Cutout(n_holes=1, length=16),  # Add Cutout with 1 hole of size 16x16
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
@@ -273,6 +276,8 @@ def train_model(num_epochs=90, batch_size=256, learning_rate=0.1):
     best_acc = 0
     target_acc_reached = False
     
+    scaler = GradScaler()  # Initialize the scaler
+    
     for epoch in range(num_epochs):
         # Training phase
         model.train()
@@ -285,10 +290,13 @@ def train_model(num_epochs=90, batch_size=256, learning_rate=0.1):
             inputs, labels = inputs.to(device), labels.to(device)
             
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+            with autocast():  # Enable mixed precision
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+            
+            scaler.scale(loss).backward()  # Scale the loss
+            scaler.step(optimizer)  # Update the parameters
+            scaler.update()  # Update the scaler
             
             running_loss += loss.item()
             _, predicted = outputs.max(1)

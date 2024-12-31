@@ -4,7 +4,7 @@ import torch.nn as nn
 class Bottleneck(nn.Module):
     expansion = 4
 
-    def __init__(self, in_channels, out_channels, stride=1, downsample=None, dropout_rate=0.5):
+    def __init__(self, in_channels, out_channels, stride=1, downsample=None):
         super(Bottleneck, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
@@ -15,7 +15,6 @@ class Bottleneck(nn.Module):
                                kernel_size=1, bias=False)
         self.bn3 = nn.BatchNorm2d(out_channels * self.expansion)
         self.relu = nn.ReLU(inplace=True)
-        self.dropout = nn.Dropout(p=dropout_rate)  # Dropout layer
         self.downsample = downsample
 
     def forward(self, x):
@@ -28,8 +27,6 @@ class Bottleneck(nn.Module):
         out = self.conv2(out)
         out = self.bn2(out)
         out = self.relu(out)
-
-        out = self.dropout(out)  # Apply dropout
 
         out = self.conv3(out)
         out = self.bn3(out)
@@ -51,13 +48,13 @@ class ResNet(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        self.layer1 = self._make_layer(block, 64, layers[0], dropout_rate=dropout_rate)
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2, dropout_rate=dropout_rate)
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2, dropout_rate=dropout_rate)
-        self.layer4 = self._make_layer(block, 512, layers[3], stride=2, dropout_rate=dropout_rate)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
 
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.dropout = nn.Dropout(p=dropout_rate)  # Dropout before fully connected layer
+        self.dropout = nn.Dropout(p=dropout_rate)
         self.fc = nn.Linear(512 * block.expansion, num_classes)
 
         # Initialize weights
@@ -74,7 +71,7 @@ class ResNet(nn.Module):
                 if isinstance(m, Bottleneck):
                     nn.init.constant_(m.bn3.weight, 0)
 
-    def _make_layer(self, block, out_channels, blocks, stride=1, dropout_rate=0.5):
+    def _make_layer(self, block, out_channels, blocks, stride=1):
         downsample = None
         if stride != 1 or self.in_channels != out_channels * block.expansion:
             downsample = nn.Sequential(
@@ -84,10 +81,10 @@ class ResNet(nn.Module):
             )
 
         layers = []
-        layers.append(block(self.in_channels, out_channels, stride, downsample, dropout_rate))
+        layers.append(block(self.in_channels, out_channels, stride, downsample))
         self.in_channels = out_channels * block.expansion
         for _ in range(1, blocks):
-            layers.append(block(self.in_channels, out_channels, dropout_rate=dropout_rate))
+            layers.append(block(self.in_channels, out_channels))
 
         return nn.Sequential(*layers)
 
@@ -106,7 +103,7 @@ class ResNet(nn.Module):
 
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
-        x = self.dropout(x)  # Apply dropout
+        x = self.dropout(x)
         x = self.fc(x)
 
         return x
