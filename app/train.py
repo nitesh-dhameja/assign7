@@ -16,6 +16,8 @@ from torchsummary import summary
 from datetime import datetime
 import pyarrow.parquet as pq
 import pyarrow as pa
+import time
+from botocore.exceptions import ClientError
 
 # Load environment variables
 load_dotenv()
@@ -24,7 +26,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class S3ImageNetDataset(Dataset):
-    def __init__(self, bucket_name, transform=None, is_train=True):
+    def __init__(self, bucket_name, transform=None, is_train=True, max_retries=3, retry_delay=1):
         """
         Dataset for loading ImageNet from S3 with streaming support
         """
@@ -32,6 +34,8 @@ class S3ImageNetDataset(Dataset):
         self.transform = transform
         self.is_train = is_train
         self.s3_client = boto3.client('s3')
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
         
         # Determine the directory (train or validation)
         self.data_dir = 'imagenet/train' if is_train else 'imagenet/validation'
@@ -40,6 +44,44 @@ class S3ImageNetDataset(Dataset):
         # List all available directories
         self.discover_structure()
         
+    def verify_arrow_file(self, file_key):
+        """
+        Verify the integrity of an Arrow file
+        """
+        try:
+            response = self.s3_client.head_object(
+                Bucket=self.bucket_name,
+                Key=file_key
+            )
+            return True
+        except ClientError as e:
+            logging.error(f"Error verifying Arrow file {file_key}: {str(e)}")
+            return False
+
+    def get_object_with_retry(self, file_key, start_byte=None, end_byte=None):
+        """
+        Get S3 object with retry logic
+        """
+        for attempt in range(self.max_retries):
+            try:
+                range_header = {}
+                if start_byte is not None and end_byte is not None:
+                    range_header['Range'] = f'bytes={start_byte}-{end_byte}'
+                
+                response = self.s3_client.get_object(
+                    Bucket=self.bucket_name,
+                    Key=file_key,
+                    **range_header
+                )
+                return response
+            except ClientError as e:
+                if attempt == self.max_retries - 1:
+                    raise
+                logging.warning(f"Retry {attempt + 1}/{self.max_retries} for {file_key}")
+                time.sleep(self.retry_delay * (attempt + 1))
+        
+        raise Exception(f"Failed to get object after {self.max_retries} retries")
+
     def discover_structure(self):
         """
         Discover the dataset structure in S3 without loading data into memory
@@ -126,42 +168,58 @@ class S3ImageNetDataset(Dataset):
                        if idx < size) - 1
         local_idx = idx - self.cumulative_sizes[file_idx]
         
-        try:
-            # Get the file
-            response = self.s3_client.get_object(
-                Bucket=self.bucket_name,
-                Key=self.arrow_files[file_idx]
-            )
-            
-            # Read the file
-            stream = pa.ipc.open_stream(response['Body'])
-            
-            # Skip to the correct batch
-            current_idx = 0
-            for batch in stream:
-                if batch is not None:
-                    batch_size = len(batch)
-                    if current_idx + batch_size > local_idx:
-                        # Found the correct batch
-                        record_idx = local_idx - current_idx
-                        image_data = batch['image'][record_idx]['bytes'].as_buffer()
-                        label = batch['label'][record_idx].as_py()
-                        
-                        # Convert to PIL Image
-                        image = Image.open(io.BytesIO(image_data)).convert('RGB')
-                        
-                        # Apply transforms
-                        if self.transform:
-                            image = self.transform(image)
-                        
-                        return image, label
-                    current_idx += batch_size
-            
-            raise ValueError(f"Could not find record at index {idx}")
-            
-        except Exception as e:
-            logging.error(f"Error loading record at index {idx} from file {self.arrow_files[file_idx]}: {str(e)}")
-            raise
+        for attempt in range(self.max_retries):
+            try:
+                # Verify file integrity
+                if not self.verify_arrow_file(self.arrow_files[file_idx]):
+                    raise ValueError(f"Arrow file {self.arrow_files[file_idx]} is corrupted")
+                
+                # Get the file with retry logic
+                response = self.get_object_with_retry(self.arrow_files[file_idx])
+                
+                # Read the file
+                stream = pa.ipc.open_stream(response['Body'])
+                
+                # Skip to the correct batch
+                current_idx = 0
+                for batch in stream:
+                    if batch is not None:
+                        batch_size = len(batch)
+                        if current_idx + batch_size > local_idx:
+                            # Found the correct batch
+                            record_idx = local_idx - current_idx
+                            try:
+                                image_data = batch['image'][record_idx]['bytes'].as_buffer()
+                                label = batch['label'][record_idx].as_py()
+                            except (KeyError, IndexError) as e:
+                                raise ValueError(f"Invalid batch data structure: {str(e)}")
+                            
+                            # Convert to PIL Image
+                            try:
+                                image = Image.open(io.BytesIO(image_data)).convert('RGB')
+                            except Exception as e:
+                                raise ValueError(f"Failed to decode image: {str(e)}")
+                            
+                            # Apply transforms
+                            if self.transform:
+                                try:
+                                    image = self.transform(image)
+                                except Exception as e:
+                                    raise ValueError(f"Transform failed: {str(e)}")
+                            
+                            return image, label
+                        current_idx += batch_size
+                
+                raise ValueError(f"Could not find record at index {idx}")
+                
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    logging.error(f"Error loading record at index {idx} from file {self.arrow_files[file_idx]}: {str(e)}")
+                    raise
+                logging.warning(f"Retry {attempt + 1}/{self.max_retries} for index {idx}")
+                time.sleep(self.retry_delay * (attempt + 1))
+        
+        raise RuntimeError(f"Failed to load record after {self.max_retries} retries")
 
 def save_training_log(epoch, train_loss, train_acc, val_loss, val_acc, timestamp):
     """
@@ -184,7 +242,7 @@ def save_training_log(epoch, train_loss, train_acc, val_loss, val_acc, timestamp
         target_met = "✅" if val_acc >= 75.0 else "❌"
         f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
 
-def train_model(num_epochs=90, batch_size=256, learning_rate=0.1):
+def train_model(num_epochs=90, batch_size=128, learning_rate=0.1):
     # Store training parameters
     train_params = {
         'Epochs': num_epochs,
@@ -193,7 +251,7 @@ def train_model(num_epochs=90, batch_size=256, learning_rate=0.1):
         'Optimizer': 'SGD',
         'Momentum': 0.9,
         'Weight Decay': 1e-4,
-        'LR Scheduler': 'CosineAnnealingLR'
+        'LR Scheduler': 'OneCycleLR'
     }
     
     # Create timestamp for logging
@@ -202,13 +260,21 @@ def train_model(num_epochs=90, batch_size=256, learning_rate=0.1):
     # Get S3 bucket info from environment
     bucket_name = os.getenv("S3_BUCKET_NAME", "era-2")  # Use era-2 as default
     
-    # Data augmentation and normalization for training
+    # Enhanced data augmentation for training
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224),
+        transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),  # More aggressive crop
         transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
+        transforms.ColorJitter(
+            brightness=0.4, 
+            contrast=0.4, 
+            saturation=0.4, 
+            hue=0.2
+        ),
+        transforms.RandomAffine(degrees=15, translate=(0.1, 0.1)),
+        transforms.RandomPerspective(distortion_scale=0.5, p=0.5),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.3)  # Add random erasing
     ])
     
     val_transform = transforms.Compose([
@@ -227,7 +293,8 @@ def train_model(num_epochs=90, batch_size=256, learning_rate=0.1):
         batch_size=batch_size,
         shuffle=True,
         num_workers=4,
-        pin_memory=True
+        pin_memory=True,
+        drop_last=True  # Drop incomplete batches
     )
     
     val_loader = DataLoader(
@@ -238,21 +305,45 @@ def train_model(num_epochs=90, batch_size=256, learning_rate=0.1):
         pin_memory=True
     )
     
-    # Initialize model
+    # Initialize model with improved initialization
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ResNet50(num_classes=len(train_dataset.class_to_idx)).to(device)
+    model = ResNet50(num_classes=len(train_dataset.class_to_idx))
     
-    # Loss function and optimizer
+    # Initialize weights properly
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+    
+    model = model.to(device)
+    
+    # Loss function and optimizer with gradient clipping
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(
         model.parameters(),
         lr=learning_rate,
         momentum=0.9,
-        weight_decay=1e-4
+        weight_decay=1e-4,
+        nesterov=True
     )
     
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    # Learning rate scheduler with warmup
+    steps_per_epoch = len(train_loader)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=learning_rate,
+        epochs=num_epochs,
+        steps_per_epoch=steps_per_epoch,
+        pct_start=0.1,  # 10% warmup
+        div_factor=25,  # Initial learning rate = max_lr/25
+        final_div_factor=1000,  # Final learning rate = max_lr/1000
+        anneal_strategy='cos'
+    )
+    
+    # Gradient clipping
+    max_grad_norm = 1.0
     
     # Training loop
     best_acc = 0
@@ -273,7 +364,12 @@ def train_model(num_epochs=90, batch_size=256, learning_rate=0.1):
             outputs = model(inputs)
             loss = criterion(outputs, labels)
             loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            
             optimizer.step()
+            scheduler.step()
             
             running_loss += loss.item()
             _, predicted = outputs.max(1)
@@ -282,7 +378,8 @@ def train_model(num_epochs=90, batch_size=256, learning_rate=0.1):
             
             pbar.set_postfix({
                 'loss': f'{running_loss/total:.4f}',
-                'acc': f'{100.*correct/total:.2f}%'
+                'acc': f'{100.*correct/total:.2f}%',
+                'lr': f'{scheduler.get_last_lr()[0]:.6f}'
             })
         
         train_acc = 100. * correct / total
@@ -308,9 +405,6 @@ def train_model(num_epochs=90, batch_size=256, learning_rate=0.1):
         val_acc = 100. * correct / total
         val_loss = val_loss / len(val_loader)
         
-        # Update learning rate
-        scheduler.step()
-        
         # Save training logs
         save_training_log(epoch, train_loss, train_acc, val_loss, val_acc, timestamp)
         
@@ -318,7 +412,8 @@ def train_model(num_epochs=90, batch_size=256, learning_rate=0.1):
         logging.info(
             f'Epoch [{epoch+1}/{num_epochs}] '
             f'Train Loss: {train_loss:.4f} Train Acc: {train_acc:.2f}% '
-            f'Val Loss: {val_loss:.4f} Val Acc: {val_acc:.2f}%'
+            f'Val Loss: {val_loss:.4f} Val Acc: {val_acc:.2f}% '
+            f'LR: {scheduler.get_last_lr()[0]:.6f}'
         )
         
         # Check if target accuracy is reached
