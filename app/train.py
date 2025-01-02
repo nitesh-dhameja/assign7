@@ -242,7 +242,7 @@ def save_training_log(epoch, train_loss, train_acc, val_loss, val_acc, timestamp
         target_met = "✅" if val_acc >= 75.0 else "❌"
         f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
 
-def train_model(num_epochs=90, batch_size=128, learning_rate=0.1):
+def train_model(num_epochs=90, batch_size=64, learning_rate=0.01):
     # Store training parameters
     train_params = {
         'Epochs': num_epochs,
@@ -258,23 +258,14 @@ def train_model(num_epochs=90, batch_size=128, learning_rate=0.1):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     # Get S3 bucket info from environment
-    bucket_name = os.getenv("S3_BUCKET_NAME", "era-2")  # Use era-2 as default
+    bucket_name = os.getenv("S3_BUCKET_NAME", "era-2")
     
-    # Enhanced data augmentation for training
+    # Simplified data augmentation for initial training
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),  # More aggressive crop
+        transforms.RandomResizedCrop(224),
         transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(
-            brightness=0.4, 
-            contrast=0.4, 
-            saturation=0.4, 
-            hue=0.2
-        ),
-        transforms.RandomAffine(degrees=15, translate=(0.1, 0.1)),
-        transforms.RandomPerspective(distortion_scale=0.5, p=0.5),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        transforms.RandomErasing(p=0.3)  # Add random erasing
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
     val_transform = transforms.Compose([
@@ -284,9 +275,22 @@ def train_model(num_epochs=90, batch_size=128, learning_rate=0.1):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    # Load datasets directly from S3
+    # Load datasets with verification
+    logging.info("Initializing datasets...")
     train_dataset = S3ImageNetDataset(bucket_name, transform=train_transform, is_train=True)
     val_dataset = S3ImageNetDataset(bucket_name, transform=val_transform, is_train=False)
+    
+    # Verify dataset sizes
+    logging.info(f"Training dataset size: {len(train_dataset)}")
+    logging.info(f"Validation dataset size: {len(val_dataset)}")
+    logging.info(f"Number of classes: {len(train_dataset.class_to_idx)}")
+    
+    # Verify a few samples
+    logging.info("Verifying data loading...")
+    sample_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+    sample_inputs, sample_labels = next(iter(sample_loader))
+    logging.info(f"Sample batch shape: {sample_inputs.shape}")
+    logging.info(f"Sample labels: {sample_labels}")
     
     train_loader = DataLoader(
         train_dataset,
@@ -294,7 +298,7 @@ def train_model(num_epochs=90, batch_size=128, learning_rate=0.1):
         shuffle=True,
         num_workers=4,
         pin_memory=True,
-        drop_last=True  # Drop incomplete batches
+        drop_last=True
     )
     
     val_loader = DataLoader(
@@ -305,25 +309,33 @@ def train_model(num_epochs=90, batch_size=128, learning_rate=0.1):
         pin_memory=True
     )
     
-    # Initialize model with improved initialization
+    # Initialize model with pretrained weights
+    logging.info("Initializing model...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ResNet50(num_classes=len(train_dataset.class_to_idx))
+    model = torchvision.models.resnet50(pretrained=True)
     
-    # Initialize weights properly
-    for m in model.modules():
-        if isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-        elif isinstance(m, nn.BatchNorm2d):
-            nn.init.constant_(m.weight, 1)
-            nn.init.constant_(m.bias, 0)
+    # Modify the final layer for our number of classes
+    num_classes = len(train_dataset.class_to_idx)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    
+    # Initialize the new layer
+    nn.init.xavier_uniform_(model.fc.weight)
+    nn.init.zeros_(model.fc.bias)
     
     model = model.to(device)
+    logging.info(f"Model moved to {device}")
     
-    # Loss function and optimizer with gradient clipping
-    criterion = nn.CrossEntropyLoss()
+    # Loss function with label smoothing
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    
+    # Separate parameter groups for different learning rates
+    parameters = [
+        {'params': [p for n, p in model.named_parameters() if 'fc' not in n], 'lr': learning_rate/10},
+        {'params': model.fc.parameters(), 'lr': learning_rate}
+    ]
+    
     optimizer = optim.SGD(
-        model.parameters(),
-        lr=learning_rate,
+        parameters,
         momentum=0.9,
         weight_decay=1e-4,
         nesterov=True
@@ -333,17 +345,14 @@ def train_model(num_epochs=90, batch_size=128, learning_rate=0.1):
     steps_per_epoch = len(train_loader)
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=learning_rate,
+        max_lr=[learning_rate/10, learning_rate],
         epochs=num_epochs,
         steps_per_epoch=steps_per_epoch,
-        pct_start=0.1,  # 10% warmup
-        div_factor=25,  # Initial learning rate = max_lr/25
-        final_div_factor=1000,  # Final learning rate = max_lr/1000
+        pct_start=0.1,
+        div_factor=10,
+        final_div_factor=100,
         anneal_strategy='cos'
     )
-    
-    # Gradient clipping
-    max_grad_norm = 1.0
     
     # Training loop
     best_acc = 0
@@ -357,30 +366,35 @@ def train_model(num_epochs=90, batch_size=128, learning_rate=0.1):
         total = 0
         
         pbar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{num_epochs}')
-        for inputs, labels in pbar:
-            inputs, labels = inputs.to(device), labels.to(device)
-            
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            
-            optimizer.step()
-            scheduler.step()
-            
-            running_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-            
-            pbar.set_postfix({
-                'loss': f'{running_loss/total:.4f}',
-                'acc': f'{100.*correct/total:.2f}%',
-                'lr': f'{scheduler.get_last_lr()[0]:.6f}'
-            })
+        for batch_idx, (inputs, labels) in enumerate(pbar):
+            try:
+                inputs, labels = inputs.to(device), labels.to(device)
+                
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                optimizer.step()
+                scheduler.step()
+                
+                running_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
+                
+                pbar.set_postfix({
+                    'loss': f'{running_loss/(batch_idx+1):.4f}',
+                    'acc': f'{100.*correct/total:.2f}%',
+                    'lr': f'{scheduler.get_last_lr()[0]:.6f}'
+                })
+                
+            except Exception as e:
+                logging.error(f"Error in training batch {batch_idx}: {str(e)}")
+                continue
         
         train_acc = 100. * correct / total
         train_loss = running_loss / len(train_loader)
