@@ -3,8 +3,10 @@ from dotenv import load_dotenv
 import torch
 import torch.optim as optim
 import torch.nn as nn
+import torchvision
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
+import torchvision.models as models
 from torch.utils.data import DataLoader, Dataset
 from models.resnet_model import ResNet50
 from tqdm import tqdm
@@ -312,7 +314,8 @@ def train_model(num_epochs=90, batch_size=64, learning_rate=0.01):
     # Initialize model with pretrained weights
     logging.info("Initializing model...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = torchvision.models.resnet50(pretrained=True)
+    # Using the new API for pretrained models
+    model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
     
     # Modify the final layer for our number of classes
     num_classes = len(train_dataset.class_to_idx)
