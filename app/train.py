@@ -244,39 +244,16 @@ def save_training_log(epoch, train_loss, train_acc, val_loss, val_acc, timestamp
         target_met = "✅" if val_acc >= 75.0 else "❌"
         f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
 
-def train_model(num_epochs=100, batch_size=32, learning_rate=0.05):
-    # Set memory management for CUDA
+def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.set_per_process_memory_fraction(0.85)
         torch.backends.cudnn.benchmark = True
     
-    # Store training parameters
-    train_params = {
-        'Epochs': num_epochs,
-        'Batch Size': batch_size,
-        'Initial Learning Rate': learning_rate,
-        'Optimizer': 'SGD',
-        'Momentum': 0.9,
-        'Weight Decay': 1e-4,
-        'LR Scheduler': 'OneCycleLR'
-    }
-    
-    # Create timestamp for logging
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Get S3 bucket info from environment
-    bucket_name = os.getenv("S3_BUCKET_NAME", "era-2")
-    
-    # Enhanced data augmentation with simpler initial transforms
+    # Basic transforms initially to ensure data loading is correct
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.2, 1.0)),  # Increased scale range
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(
-            brightness=0.3,
-            contrast=0.3,
-            saturation=0.3
-        ),
+        transforms.Resize(256),
+        transforms.CenterCrop(224),  # Start with center crop only
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
@@ -292,6 +269,9 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.05):
     logging.info("Initializing datasets...")
     train_dataset = S3ImageNetDataset(bucket_name, transform=train_transform, is_train=True)
     val_dataset = S3ImageNetDataset(bucket_name, transform=val_transform, is_train=False)
+    
+    num_classes = len(train_dataset.class_to_idx)
+    logging.info(f"Number of classes: {num_classes}")
     
     # DataLoader settings
     train_loader = DataLoader(
@@ -313,63 +293,56 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.05):
         persistent_workers=True
     )
     
-    # Initialize model
+    # Initialize model with custom initialization
     logging.info("Initializing ResNet50 from scratch...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = models.resnet50(weights=None)
     
-    # Modified initialization for better initial learning
+    # Custom initialization for better initial learning
     def init_weights(m):
         if isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            # Initialize first layer differently
+            if m.in_channels == 3:
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)
+            else:
+                nn.init.kaiming_uniform_(m.weight, mode='fan_in', nonlinearity='relu')
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.BatchNorm2d):
-            nn.init.constant_(m.weight, 1)
-            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0.0)
         elif isinstance(m, nn.Linear):
-            # Modified initialization for the final layer
-            if m == model.fc:
-                nn.init.normal_(m.weight, mean=0.0, std=0.01)
-            else:
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
+            nn.init.xavier_uniform_(m.weight)
+            nn.init.zeros_(m.bias)
     
     model.apply(init_weights)
     model = model.to(device)
     
-    # Loss function with reduced label smoothing
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    # Print model summary
+    logging.info("Model architecture:")
+    for name, layer in model.named_children():
+        logging.info(f"{name}: {layer}")
     
-    # Gradient accumulation with smaller steps
-    accumulation_steps = 8  # Increased steps for smaller effective batch size
-    effective_batch_size = batch_size * accumulation_steps
-    logging.info(f"Using gradient accumulation. Effective batch size: {effective_batch_size}")
+    # Basic cross entropy loss initially
+    criterion = nn.CrossEntropyLoss()
     
-    # Modified optimizer settings
-    optimizer = optim.SGD(
+    # Use Adam optimizer initially for better convergence
+    optimizer = optim.Adam(
         model.parameters(),
         lr=learning_rate,
-        momentum=0.9,
-        weight_decay=5e-5,  # Reduced weight decay
-        nesterov=True
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=1e-4
     )
     
-    # Learning rate scheduler with modified warmup
-    steps_per_epoch = len(train_loader) // accumulation_steps
-    scheduler = optim.lr_scheduler.OneCycleLR(
+    # Simple step LR scheduler
+    scheduler = optim.lr_scheduler.StepLR(
         optimizer,
-        max_lr=learning_rate,
-        epochs=num_epochs,
-        steps_per_epoch=steps_per_epoch,
-        pct_start=0.2,  # Shorter warmup
-        div_factor=25,  # More aggressive initial LR reduction
-        final_div_factor=1000,
-        anneal_strategy='linear'  # Changed to linear for smoother transition
+        step_size=30,
+        gamma=0.1
     )
     
-    # Training loop with gradient accumulation
+    # Training loop without gradient accumulation initially
     best_acc = 0
     target_acc_reached = False
     
@@ -379,28 +352,23 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.05):
         running_loss = 0.0
         correct = 0
         total = 0
-        optimizer.zero_grad()  # Zero gradients at start of epoch
         
         pbar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{num_epochs}')
         for batch_idx, (inputs, labels) in enumerate(pbar):
             try:
                 inputs, labels = inputs.to(device), labels.to(device)
                 
-                # Forward pass
+                optimizer.zero_grad()
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
-                loss = loss / accumulation_steps  # Scale loss
                 loss.backward()
                 
-                # Update weights every accumulation_steps batches
-                if (batch_idx + 1) % accumulation_steps == 0:
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 
-                running_loss += loss.item() * accumulation_steps
+                optimizer.step()
+                
+                running_loss += loss.item()
                 _, predicted = outputs.max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
@@ -408,17 +376,21 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.05):
                 pbar.set_postfix({
                     'loss': f'{running_loss/(batch_idx+1):.4f}',
                     'acc': f'{100.*correct/total:.2f}%',
-                    'lr': f'{scheduler.get_last_lr()[0]:.6f}'
+                    'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
                 })
                 
-                # Clear cache periodically
-                if batch_idx % 100 == 0 and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # Monitor gradients periodically
+                if batch_idx % 100 == 0:
+                    for name, param in model.named_parameters():
+                        if param.grad is not None:
+                            grad_norm = param.grad.norm().item()
+                            if grad_norm > 10:
+                                logging.warning(f"Large gradient in {name}: {grad_norm}")
                 
             except Exception as e:
                 logging.error(f"Error in training batch {batch_idx}: {str(e)}")
                 if torch.cuda.is_available():
-                    torch.cuda.empty_cache()  # Clear cache on error
+                    torch.cuda.empty_cache()
                 continue
         
         train_acc = 100. * correct / total
@@ -452,7 +424,7 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.05):
             f'Epoch [{epoch+1}/{num_epochs}] '
             f'Train Loss: {train_loss:.4f} Train Acc: {train_acc:.2f}% '
             f'Val Loss: {val_loss:.4f} Val Acc: {val_acc:.2f}% '
-            f'LR: {scheduler.get_last_lr()[0]:.6f}'
+            f'LR: {optimizer.param_groups[0]["lr"]:.6f}'
         )
         
         # Check if target accuracy is reached
