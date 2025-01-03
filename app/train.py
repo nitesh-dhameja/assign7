@@ -260,20 +260,12 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
         raise ValueError("S3_BUCKET_NAME environment variable is not set")
     logging.info(f"Using S3 bucket: {bucket_name}")
     
-    # Enhanced transforms with regularization
+    # Basic transforms initially to ensure data loading is correct
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(
-            brightness=0.4,
-            contrast=0.4,
-            saturation=0.4,
-            hue=0.2
-        ),
-        transforms.RandomAffine(degrees=15, translate=(0.1, 0.1)),
+        transforms.Resize(256),
+        transforms.CenterCrop(224),  # Start with center crop only
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        transforms.RandomErasing(p=0.2)
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
     val_transform = transforms.Compose([
@@ -323,14 +315,14 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
             if m.in_channels == 3:
                 nn.init.normal_(m.weight, mean=0.0, std=0.01)
             else:
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_uniform_(m.weight, mode='fan_in', nonlinearity='relu')
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.BatchNorm2d):
             nn.init.constant_(m.weight, 1.0)
             nn.init.constant_(m.bias, 0.0)
         elif isinstance(m, nn.Linear):
-            nn.init.xavier_normal_(m.weight, gain=1.0)
+            nn.init.xavier_uniform_(m.weight)
             nn.init.zeros_(m.bias)
     
     model.apply(init_weights)
@@ -341,29 +333,23 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
     for name, layer in model.named_children():
         logging.info(f"{name}: {layer}")
     
-    # Loss function with label smoothing
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # Basic cross entropy loss initially
+    criterion = nn.CrossEntropyLoss()
     
-    # Use SGD with momentum and proper LR
-    optimizer = optim.SGD(
+    # Use Adam optimizer initially for better convergence
+    optimizer = optim.Adam(
         model.parameters(),
-        lr=0.1,  # Higher initial learning rate
-        momentum=0.9,
-        weight_decay=1e-4,
-        nesterov=True
+        lr=learning_rate,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=1e-4
     )
     
-    # OneCycle learning rate scheduler
-    steps_per_epoch = len(train_loader)
-    scheduler = optim.lr_scheduler.OneCycleLR(
+    # Simple step LR scheduler
+    scheduler = optim.lr_scheduler.StepLR(
         optimizer,
-        max_lr=0.1,
-        epochs=num_epochs,
-        steps_per_epoch=steps_per_epoch,
-        pct_start=0.3,  # Longer warmup
-        div_factor=10,
-        final_div_factor=100,
-        anneal_strategy='cos'
+        step_size=30,
+        gamma=0.1
     )
     
     # Training loop without gradient accumulation initially
