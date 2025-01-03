@@ -244,13 +244,12 @@ def save_training_log(epoch, train_loss, train_acc, val_loss, val_acc, timestamp
         target_met = "✅" if val_acc >= 75.0 else "❌"
         f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
 
-def train_model(num_epochs=100, batch_size=64, learning_rate=0.1):
+def train_model(num_epochs=100, batch_size=32, learning_rate=0.05):
     # Set memory management for CUDA
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()  # Clear cache before starting
-        # Set memory allocator settings
-        torch.cuda.set_per_process_memory_fraction(0.85)  # Use only 85% of available memory
-        torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner
+        torch.cuda.empty_cache()
+        torch.cuda.set_per_process_memory_fraction(0.85)
+        torch.backends.cudnn.benchmark = True
     
     # Store training parameters
     train_params = {
@@ -269,19 +268,17 @@ def train_model(num_epochs=100, batch_size=64, learning_rate=0.1):
     # Get S3 bucket info from environment
     bucket_name = os.getenv("S3_BUCKET_NAME", "era-2")
     
-    # Enhanced data augmentation with memory-efficient transforms
+    # Enhanced data augmentation with simpler initial transforms
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),
+        transforms.RandomResizedCrop(224, scale=(0.2, 1.0)),  # Increased scale range
         transforms.RandomHorizontalFlip(),
         transforms.ColorJitter(
-            brightness=0.4,
-            contrast=0.4,
-            saturation=0.4,
-            hue=0.2
+            brightness=0.3,
+            contrast=0.3,
+            saturation=0.3
         ),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        transforms.RandomErasing(p=0.2)
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
     val_transform = transforms.Compose([
@@ -291,42 +288,37 @@ def train_model(num_epochs=100, batch_size=64, learning_rate=0.1):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    # Load datasets with verification
+    # Load datasets
     logging.info("Initializing datasets...")
     train_dataset = S3ImageNetDataset(bucket_name, transform=train_transform, is_train=True)
     val_dataset = S3ImageNetDataset(bucket_name, transform=val_transform, is_train=False)
     
-    # Verify dataset sizes
-    logging.info(f"Training dataset size: {len(train_dataset)}")
-    logging.info(f"Validation dataset size: {len(val_dataset)}")
-    logging.info(f"Number of classes: {len(train_dataset.class_to_idx)}")
-    
-    # Adjust DataLoader settings for memory efficiency
+    # DataLoader settings
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,  # Reduced workers
+        num_workers=4,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=True  # Keep workers alive between iterations
+        persistent_workers=True
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,  # Reduced workers
+        num_workers=4,
         pin_memory=True,
         persistent_workers=True
     )
     
-    # Initialize model with memory tracking
+    # Initialize model
     logging.info("Initializing ResNet50 from scratch...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = models.resnet50(weights=None)
     
-    # Initialize weights
+    # Modified initialization for better initial learning
     def init_weights(m):
         if isinstance(m, nn.Conv2d):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -336,44 +328,45 @@ def train_model(num_epochs=100, batch_size=64, learning_rate=0.1):
             nn.init.constant_(m.weight, 1)
             nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, std=0.01)
-            nn.init.zeros_(m.bias)
+            # Modified initialization for the final layer
+            if m == model.fc:
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)
+            else:
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
     
     model.apply(init_weights)
     model = model.to(device)
-    logging.info(f"Model moved to {device}")
     
-    if torch.cuda.is_available():
-        logging.info(f"GPU Memory allocated: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
-        logging.info(f"GPU Memory cached: {torch.cuda.memory_reserved()/1024**2:.2f} MB")
+    # Loss function with reduced label smoothing
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
     
-    # Loss function with label smoothing
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    
-    # Optimizer with gradient accumulation steps
-    accumulation_steps = 4  # Accumulate gradients over 4 batches
+    # Gradient accumulation with smaller steps
+    accumulation_steps = 8  # Increased steps for smaller effective batch size
     effective_batch_size = batch_size * accumulation_steps
     logging.info(f"Using gradient accumulation. Effective batch size: {effective_batch_size}")
     
+    # Modified optimizer settings
     optimizer = optim.SGD(
         model.parameters(),
-        lr=learning_rate * (effective_batch_size/256),  # Scale learning rate
+        lr=learning_rate,
         momentum=0.9,
-        weight_decay=1e-4,
+        weight_decay=5e-5,  # Reduced weight decay
         nesterov=True
     )
     
-    # Learning rate scheduler
+    # Learning rate scheduler with modified warmup
     steps_per_epoch = len(train_loader) // accumulation_steps
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=learning_rate * (effective_batch_size/256),
+        max_lr=learning_rate,
         epochs=num_epochs,
         steps_per_epoch=steps_per_epoch,
-        pct_start=0.45,
-        div_factor=10,
-        final_div_factor=100,
-        anneal_strategy='cos'
+        pct_start=0.2,  # Shorter warmup
+        div_factor=25,  # More aggressive initial LR reduction
+        final_div_factor=1000,
+        anneal_strategy='linear'  # Changed to linear for smoother transition
     )
     
     # Training loop with gradient accumulation
