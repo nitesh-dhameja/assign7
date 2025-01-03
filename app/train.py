@@ -245,10 +245,20 @@ def save_training_log(epoch, train_loss, train_acc, val_loss, val_acc, timestamp
         f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
 
 def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
+    # Set memory management for CUDA
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.set_per_process_memory_fraction(0.85)
         torch.backends.cudnn.benchmark = True
+    
+    # Create timestamp for logging
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Get S3 bucket info from environment
+    bucket_name = os.getenv("S3_BUCKET_NAME")
+    if not bucket_name:
+        raise ValueError("S3_BUCKET_NAME environment variable is not set")
+    logging.info(f"Using S3 bucket: {bucket_name}")
     
     # Basic transforms initially to ensure data loading is correct
     train_transform = transforms.Compose([
