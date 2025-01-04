@@ -244,7 +244,7 @@ def save_training_log(epoch, train_loss, train_acc, val_loss, val_acc, timestamp
         target_met = "✅" if val_acc >= 75.0 else "❌"
         f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
 
-def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
+def train_model(num_epochs=100, batch_size=32, learning_rate=0.0005):
     # Set memory management for CUDA
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -260,12 +260,20 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
         raise ValueError("S3_BUCKET_NAME environment variable is not set")
     logging.info(f"Using S3 bucket: {bucket_name}")
     
-    # Basic transforms initially to ensure data loading is correct
+    # Enhanced transforms with regularization
     train_transform = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),  # Start with center crop only
+        transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(
+            brightness=0.4,
+            contrast=0.4,
+            saturation=0.4,
+            hue=0.2
+        ),
+        transforms.RandomAffine(degrees=15, translate=(0.1, 0.1)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.3)
     ])
     
     val_transform = transforms.Compose([
@@ -283,7 +291,6 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
     num_classes = len(train_dataset.class_to_idx)
     logging.info(f"Number of classes: {num_classes}")
     
-    # DataLoader settings
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -303,54 +310,63 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
         persistent_workers=True
     )
     
-    # Initialize model with custom initialization
+    # Initialize model
     logging.info("Initializing ResNet50 from scratch...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = models.resnet50(weights=None)
     
-    # Custom initialization for better initial learning
+    # Add dropout layers
+    model.layer1 = nn.Sequential(model.layer1, nn.Dropout(0.1))
+    model.layer2 = nn.Sequential(model.layer2, nn.Dropout(0.1))
+    model.layer3 = nn.Sequential(model.layer3, nn.Dropout(0.2))
+    model.layer4 = nn.Sequential(model.layer4, nn.Dropout(0.2))
+    
     def init_weights(m):
         if isinstance(m, nn.Conv2d):
-            # Initialize first layer differently
-            if m.in_channels == 3:
-                nn.init.normal_(m.weight, mean=0.0, std=0.01)
-            else:
-                nn.init.kaiming_uniform_(m.weight, mode='fan_in', nonlinearity='relu')
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.BatchNorm2d):
             nn.init.constant_(m.weight, 1.0)
             nn.init.constant_(m.bias, 0.0)
         elif isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight)
+            nn.init.xavier_normal_(m.weight)
             nn.init.zeros_(m.bias)
     
     model.apply(init_weights)
     model = model.to(device)
     
-    # Print model summary
-    logging.info("Model architecture:")
-    for name, layer in model.named_children():
-        logging.info(f"{name}: {layer}")
+    # Loss function with label smoothing
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
-    # Basic cross entropy loss initially
-    criterion = nn.CrossEntropyLoss()
-    
-    # Use Adam optimizer initially for better convergence
-    optimizer = optim.Adam(
+    # Optimizer with weight decay
+    optimizer = optim.AdamW(  # Switch to AdamW for better regularization
         model.parameters(),
         lr=learning_rate,
         betas=(0.9, 0.999),
         eps=1e-8,
-        weight_decay=1e-4
+        weight_decay=0.05  # Increased weight decay
     )
     
-    # Simple step LR scheduler
-    scheduler = optim.lr_scheduler.StepLR(
+    # Cosine annealing scheduler with warmup
+    num_steps = len(train_loader) * num_epochs
+    warmup_steps = len(train_loader) * 5  # 5 epochs of warmup
+    
+    scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        step_size=30,
-        gamma=0.1
+        max_lr=learning_rate,
+        epochs=num_epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.1,  # 10% warmup
+        anneal_strategy='cos',
+        div_factor=25,
+        final_div_factor=1000
     )
+    
+    # Print model summary
+    logging.info("Model architecture:")
+    for name, layer in model.named_children():
+        logging.info(f"{name}: {layer}")
     
     # Training loop without gradient accumulation initially
     best_acc = 0
