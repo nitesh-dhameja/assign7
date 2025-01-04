@@ -244,12 +244,15 @@ def save_training_log(epoch, train_loss, train_acc, val_loss, val_acc, timestamp
         target_met = "✅" if val_acc >= 75.0 else "❌"
         f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
 
-def train_model(num_epochs=100, batch_size=32, learning_rate=0.0005):
+def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
     # Set memory management for CUDA
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        torch.cuda.set_per_process_memory_fraction(0.85)
+        # Set memory allocator settings
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segments:True'
+        torch.cuda.set_per_process_memory_fraction(0.7)  # Reduced memory fraction
         torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = True  # More memory efficient
     
     # Create timestamp for logging
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -260,20 +263,14 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.0005):
         raise ValueError("S3_BUCKET_NAME environment variable is not set")
     logging.info(f"Using S3 bucket: {bucket_name}")
     
-    # Enhanced transforms with regularization
+    # Memory-efficient transforms
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),
+        transforms.Resize(256),  # Smaller initial size
+        transforms.RandomCrop(224),
         transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(
-            brightness=0.4,
-            contrast=0.4,
-            saturation=0.4,
-            hue=0.2
-        ),
-        transforms.RandomAffine(degrees=15, translate=(0.1, 0.1)),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        transforms.RandomErasing(p=0.3)
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
     val_transform = transforms.Compose([
@@ -291,23 +288,26 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.0005):
     num_classes = len(train_dataset.class_to_idx)
     logging.info(f"Number of classes: {num_classes}")
     
+    # DataLoader with reduced workers and prefetch factor
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=2,  # Reduced workers
         pin_memory=True,
         drop_last=True,
-        persistent_workers=True
+        persistent_workers=True,
+        prefetch_factor=2  # Reduced prefetch
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=2,  # Reduced workers
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=True,
+        prefetch_factor=2
     )
     
     # Initialize model
@@ -315,11 +315,11 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.0005):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = models.resnet50(weights=None)
     
-    # Add dropout layers
+    # Memory-efficient model modifications
     model.layer1 = nn.Sequential(model.layer1, nn.Dropout(0.1))
     model.layer2 = nn.Sequential(model.layer2, nn.Dropout(0.1))
-    model.layer3 = nn.Sequential(model.layer3, nn.Dropout(0.2))
-    model.layer4 = nn.Sequential(model.layer4, nn.Dropout(0.2))
+    model.layer3 = nn.Sequential(model.layer3, nn.Dropout(0.1))
+    model.layer4 = nn.Sequential(model.layer4, nn.Dropout(0.1))
     
     def init_weights(m):
         if isinstance(m, nn.Conv2d):
@@ -336,31 +336,28 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.0005):
     model.apply(init_weights)
     model = model.to(device)
     
-    # Loss function with label smoothing
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # Basic cross entropy loss
+    criterion = nn.CrossEntropyLoss()
     
-    # Optimizer with weight decay
-    optimizer = optim.AdamW(  # Switch to AdamW for better regularization
+    # Gradient accumulation steps
+    accumulation_steps = 4  # Accumulate gradients over 4 steps
+    effective_batch_size = batch_size * accumulation_steps
+    logging.info(f"Using gradient accumulation. Effective batch size: {effective_batch_size}")
+    
+    # Optimizer with reduced memory usage
+    optimizer = optim.AdamW(
         model.parameters(),
         lr=learning_rate,
         betas=(0.9, 0.999),
         eps=1e-8,
-        weight_decay=0.05  # Increased weight decay
+        weight_decay=0.01
     )
     
-    # Cosine annealing scheduler with warmup
-    num_steps = len(train_loader) * num_epochs
-    warmup_steps = len(train_loader) * 5  # 5 epochs of warmup
-    
-    scheduler = optim.lr_scheduler.OneCycleLR(
+    # Simple step scheduler to reduce memory usage
+    scheduler = optim.lr_scheduler.StepLR(
         optimizer,
-        max_lr=learning_rate,
-        epochs=num_epochs,
-        steps_per_epoch=len(train_loader),
-        pct_start=0.1,  # 10% warmup
-        anneal_strategy='cos',
-        div_factor=25,
-        final_div_factor=1000
+        step_size=30,
+        gamma=0.1
     )
     
     # Print model summary
@@ -368,113 +365,130 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.0005):
     for name, layer in model.named_children():
         logging.info(f"{name}: {layer}")
     
-    # Training loop without gradient accumulation initially
-    best_acc = 0
-    target_acc_reached = False
+    # Training loop
+    best_val_acc = 0.0
+    train_losses = []
+    val_losses = []
+    train_accs = []
+    val_accs = []
+    
+    logging.info("Starting training...")
+    
+    # Create markdown file for logging
+    log_file = f"training_log_{timestamp}.md"
+    with open(log_file, "w") as f:
+        f.write("| Epoch | Train Loss | Train Acc | Val Loss | Val Acc | Target Met |\n")
+        f.write("|-------|------------|-----------|----------|----------|------------|\n")
     
     for epoch in range(num_epochs):
-        # Training phase
         model.train()
         running_loss = 0.0
         correct = 0
         total = 0
+        optimizer.zero_grad()  # Zero gradients at start of epoch
         
-        pbar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{num_epochs}')
-        for batch_idx, (inputs, labels) in enumerate(pbar):
-            try:
-                inputs, labels = inputs.to(device), labels.to(device)
-                
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-                
+        # Training phase
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
+        for batch_idx, (inputs, targets) in enumerate(pbar):
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            # Forward pass
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss = loss / accumulation_steps  # Normalize loss
+            
+            # Backward pass
+            loss.backward()
+            
+            # Gradient accumulation
+            if (batch_idx + 1) % accumulation_steps == 0:
                 optimizer.step()
-                
-                running_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-                
-                pbar.set_postfix({
-                    'loss': f'{running_loss/(batch_idx+1):.4f}',
-                    'acc': f'{100.*correct/total:.2f}%',
-                    'lr': f'{optimizer.param_groups[0]["lr"]:.6f}'
-                })
-                
-                # Monitor gradients periodically
-                if batch_idx % 100 == 0:
-                    for name, param in model.named_parameters():
-                        if param.grad is not None:
-                            grad_norm = param.grad.norm().item()
-                            if grad_norm > 10:
-                                logging.warning(f"Large gradient in {name}: {grad_norm}")
-                
-            except Exception as e:
-                logging.error(f"Error in training batch {batch_idx}: {str(e)}")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                continue
+                optimizer.zero_grad()
+            
+            # Update metrics
+            running_loss += loss.item() * accumulation_steps
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+            
+            # Update progress bar
+            train_acc = 100. * correct / total
+            pbar.set_postfix({
+                'loss': running_loss / (batch_idx + 1),
+                'acc': f'{train_acc:.2f}%'
+            })
+            
+            # Clear cache periodically
+            if batch_idx % 50 == 0:
+                torch.cuda.empty_cache()
         
-        train_acc = 100. * correct / total
         train_loss = running_loss / len(train_loader)
+        train_acc = 100. * correct / total
         
         # Validation phase
         model.eval()
-        val_loss = 0
+        val_loss = 0.0
         correct = 0
         total = 0
         
         with torch.no_grad():
-            for inputs, labels in tqdm(val_loader, desc='Validation'):
-                inputs, labels = inputs.to(device), labels.to(device)
+            for inputs, targets in tqdm(val_loader, desc='Validation'):
+                inputs, targets = inputs.to(device), targets.to(device)
                 outputs = model(inputs)
-                loss = criterion(outputs, labels)
+                loss = criterion(outputs, targets)
                 
                 val_loss += loss.item()
                 _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
+                total += targets.size(0)
+                correct += predicted.eq(targets).sum().item()
+                
+                # Clear cache periodically
+                torch.cuda.empty_cache()
         
-        val_acc = 100. * correct / total
         val_loss = val_loss / len(val_loader)
+        val_acc = 100. * correct / total
         
-        # Save training logs
-        save_training_log(epoch, train_loss, train_acc, val_loss, val_acc, timestamp)
+        # Update learning rate
+        scheduler.step()
         
-        # Log progress
-        logging.info(
-            f'Epoch [{epoch+1}/{num_epochs}] '
-            f'Train Loss: {train_loss:.4f} Train Acc: {train_acc:.2f}% '
-            f'Val Loss: {val_loss:.4f} Val Acc: {val_acc:.2f}% '
-            f'LR: {optimizer.param_groups[0]["lr"]:.6f}'
-        )
+        # Save metrics
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
         
-        # Check if target accuracy is reached
-        if val_acc >= 70.0 and not target_acc_reached:  # Changed target to 70%
-            target_acc_reached = True
-            logging.info(f'🎉 Target top-1 accuracy of 70% reached at epoch {epoch+1}!')
-            torch.save(model.state_dict(), f'model_target_acc_{timestamp}.pth')
+        # Check if target accuracy is met
+        target_met = "✓" if val_acc >= 75.0 else "✗"
+        
+        # Log results
+        logging.info(f'Epoch {epoch+1:3d}/{num_epochs} - '
+                    f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, '
+                    f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+        
+        # Save to markdown file
+        with open(log_file, "a") as f:
+            f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
         
         # Save best model
-        if val_acc > best_acc:
-            best_acc = val_acc
-            torch.save(model.state_dict(), f'best_model_{timestamp}.pth')
-            logging.info(f'New best model saved with accuracy: {best_acc:.2f}%')
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'train_acc': train_acc,
+                'val_acc': val_acc,
+            }, f'best_model_{timestamp}.pth')
+            
+            logging.info(f'New best model saved with validation accuracy: {val_acc:.2f}%')
+        
+        # Clear cache at end of epoch
+        torch.cuda.empty_cache()
     
-    # Final summary
-    logging.info("\n" + "="*50)
-    logging.info("Training Complete!")
-    logging.info(f"Best Validation Accuracy: {best_acc:.2f}%")
-    if target_acc_reached:
-        logging.info("✅ Target top-1 accuracy of 70% was achieved!")
-    else:
-        logging.info("❌ Target top-1 accuracy of 70% was not reached.")
-    logging.info(f"Training logs saved to: logs/training_log_{timestamp}.md")
-    logging.info("="*50)
+    return train_losses, val_losses, train_accs, val_accs
 
 if __name__ == "__main__":
     train_model() 
