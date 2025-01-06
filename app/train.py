@@ -245,6 +245,9 @@ def save_training_log(epoch, train_loss, train_acc, val_loss, val_acc, timestamp
         f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
 
 def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
+    # Track start time
+    start_time = time.time()
+    
     # Set memory management for CUDA
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -257,20 +260,50 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
     # Create timestamp for logging
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
+    # Create logs directory if it doesn't exist
+    logs_dir = os.path.join(os.getcwd(), 'logs')
+    os.makedirs(logs_dir, exist_ok=True)
+    
+    # Set up log file path
+    log_file = os.path.join(logs_dir, f"training_log_{timestamp}.md")
+    
+    # Initialize markdown log file
+    with open(log_file, "w") as f:
+        f.write("# ImageNet Training Log\n\n")
+        f.write("## Training Configuration\n")
+        f.write(f"- Batch Size: {batch_size}\n")
+        f.write(f"- Learning Rate: {learning_rate}\n")
+        f.write(f"- Number of Epochs: {num_epochs}\n")
+        f.write(f"- Gradient Accumulation Steps: {accumulation_steps}\n")
+        f.write(f"- Effective Batch Size: {effective_batch_size}\n\n")
+        f.write("## Training Progress\n\n")
+        f.write("| Epoch | Train Loss | Train Acc | Val Loss | Val Acc | Target Met |\n")
+        f.write("|-------|------------|-----------|----------|----------|------------|\n")
+    
+    logging.info(f"Training logs will be saved to: {log_file}")
+    
     # Get S3 bucket info from environment
     bucket_name = os.getenv("S3_BUCKET_NAME")
     if not bucket_name:
         raise ValueError("S3_BUCKET_NAME environment variable is not set")
     logging.info(f"Using S3 bucket: {bucket_name}")
     
-    # Memory-efficient transforms
+    # Memory-efficient transforms with stronger augmentation
     train_transform = transforms.Compose([
-        transforms.Resize(256),  # Smaller initial size
-        transforms.RandomCrop(224),
+        transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),
         transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
+        transforms.RandomVerticalFlip(p=0.2),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(
+            brightness=0.4,
+            contrast=0.4,
+            saturation=0.4,
+            hue=0.2
+        ),
+        transforms.RandomAffine(degrees=15, translate=(0.1, 0.1), scale=(0.9, 1.1)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.3)
     ])
     
     val_transform = transforms.Compose([
@@ -315,11 +348,27 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = models.resnet50(weights=None)
     
-    # Memory-efficient model modifications
-    model.layer1 = nn.Sequential(model.layer1, nn.Dropout(0.1))
-    model.layer2 = nn.Sequential(model.layer2, nn.Dropout(0.1))
-    model.layer3 = nn.Sequential(model.layer3, nn.Dropout(0.1))
-    model.layer4 = nn.Sequential(model.layer4, nn.Dropout(0.1))
+    # Memory-efficient model modifications with stronger regularization
+    model.layer1 = nn.Sequential(
+        model.layer1,
+        nn.Dropout(0.3),
+        nn.BatchNorm2d(256)
+    )
+    model.layer2 = nn.Sequential(
+        model.layer2,
+        nn.Dropout(0.3),
+        nn.BatchNorm2d(512)
+    )
+    model.layer3 = nn.Sequential(
+        model.layer3,
+        nn.Dropout(0.4),
+        nn.BatchNorm2d(1024)
+    )
+    model.layer4 = nn.Sequential(
+        model.layer4,
+        nn.Dropout(0.4),
+        nn.BatchNorm2d(2048)
+    )
     
     def init_weights(m):
         if isinstance(m, nn.Conv2d):
@@ -336,28 +385,39 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
     model.apply(init_weights)
     model = model.to(device)
     
-    # Basic cross entropy loss
-    criterion = nn.CrossEntropyLoss()
+    # Cross entropy loss with label smoothing
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
     # Gradient accumulation steps
     accumulation_steps = 4  # Accumulate gradients over 4 steps
     effective_batch_size = batch_size * accumulation_steps
     logging.info(f"Using gradient accumulation. Effective batch size: {effective_batch_size}")
     
-    # Optimizer with reduced memory usage
+    # Set gradient clipping
+    max_grad_norm = 1.0
+    
+    # Optimizer with stronger regularization
     optimizer = optim.AdamW(
         model.parameters(),
         lr=learning_rate,
         betas=(0.9, 0.999),
         eps=1e-8,
-        weight_decay=0.01
+        weight_decay=0.1  # Increased weight decay
     )
     
-    # Simple step scheduler to reduce memory usage
-    scheduler = optim.lr_scheduler.StepLR(
+    # Learning rate scheduler with warmup and cosine decay
+    num_steps = len(train_loader) * num_epochs
+    warmup_steps = len(train_loader) * 5  # 5 epochs warmup
+    
+    scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        step_size=30,
-        gamma=0.1
+        max_lr=learning_rate,
+        epochs=num_epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.1,  # 10% warmup
+        anneal_strategy='cos',
+        div_factor=25,
+        final_div_factor=1000
     )
     
     # Print model summary
@@ -402,8 +462,13 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
             
             # Gradient accumulation
             if (batch_idx + 1) % accumulation_steps == 0:
+                # Clip gradients
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad()
+                
+                # Update learning rate
+                scheduler.step()
             
             # Update metrics
             running_loss += loss.item() * accumulation_steps
@@ -448,9 +513,6 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
         val_loss = val_loss / len(val_loader)
         val_acc = 100. * correct / total
         
-        # Update learning rate
-        scheduler.step()
-        
         # Save metrics
         train_losses.append(train_loss)
         val_losses.append(val_loss)
@@ -466,8 +528,12 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
                     f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
         
         # Save to markdown file
-        with open(log_file, "a") as f:
-            f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
+        try:
+            with open(log_file, "a") as f:
+                f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
+            logging.info(f"Saved logs for epoch {epoch+1} to {log_file}")
+        except Exception as e:
+            logging.error(f"Failed to save logs for epoch {epoch+1}: {str(e)}")
         
         # Save best model
         if val_acc > best_val_acc:
@@ -487,6 +553,17 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
         
         # Clear cache at end of epoch
         torch.cuda.empty_cache()
+    
+    # Add final summary to log file
+    try:
+        with open(log_file, "a") as f:
+            f.write("\n## Training Summary\n\n")
+            f.write(f"- Best Validation Accuracy: {best_val_acc:.2f}%\n")
+            f.write(f"- Target Accuracy (75.0%) {'Achieved' if best_val_acc >= 75.0 else 'Not Achieved'}\n")
+            f.write(f"- Total Training Time: {time.time() - start_time:.2f} seconds\n")
+        logging.info(f"Training summary saved to {log_file}")
+    except Exception as e:
+        logging.error(f"Failed to save training summary: {str(e)}")
     
     return train_losses, val_losses, train_accs, val_accs
 
