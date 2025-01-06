@@ -244,23 +244,27 @@ def save_training_log(epoch, train_loss, train_acc, val_loss, val_acc, timestamp
         target_met = "✅" if val_acc >= 75.0 else "❌"
         f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
 
-def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
+def train_model(num_epochs=100, batch_size=8, learning_rate=0.0005):
     # Track start time
     start_time = time.time()
     
     # Define training configuration
-    accumulation_steps = 4  # Accumulate gradients over 4 steps
+    accumulation_steps = 8  # Increased accumulation steps to maintain effective batch size
     effective_batch_size = batch_size * accumulation_steps
     max_grad_norm = 1.0  # For gradient clipping
     
     # Set memory management for CUDA
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        # Set memory allocator settings
-        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segments:True'
-        torch.cuda.set_per_process_memory_fraction(0.7)  # Reduced memory fraction
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = True  # More memory efficient
+        # Set memory allocator settings for better memory management
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
+        torch.cuda.set_per_process_memory_fraction(0.5)  # Further reduced memory fraction
+        torch.backends.cudnn.benchmark = False  # Disable benchmark for more stable memory usage
+        torch.backends.cudnn.deterministic = True
+        
+        # Enable gradient checkpointing for memory efficiency
+        torch.backends.cudnn.enabled = True
+        torch.cuda.empty_cache()
     
     # Create timestamp for logging
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -326,69 +330,64 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
     num_classes = len(train_dataset.class_to_idx)
     logging.info(f"Number of classes: {num_classes}")
     
-    # DataLoader with reduced workers and prefetch factor
+    # DataLoader with minimal workers
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=2,  # Reduced workers
-        pin_memory=True,
+        num_workers=1,  # Reduced workers
+        pin_memory=False,  # Disabled pin_memory
         drop_last=True,
-        persistent_workers=True,
-        prefetch_factor=2  # Reduced prefetch
+        persistent_workers=False,  # Disabled persistent workers
+        prefetch_factor=1  # Minimal prefetch
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=2,  # Reduced workers
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2
+        num_workers=1,
+        pin_memory=False,
+        persistent_workers=False,
+        prefetch_factor=1
     )
     
-    # Initialize model
-    logging.info("Initializing ResNet50 from scratch...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Initialize model with gradient checkpointing
     model = models.resnet50(weights=None)
+    model.train()
     
-    # Memory-efficient model modifications with stronger regularization
+    # Enable gradient checkpointing
+    model.layer1.apply(lambda m: m.register_forward_hook(lambda m, _, output: output.requires_grad_(True)))
+    model.layer2.apply(lambda m: m.register_forward_hook(lambda m, _, output: output.requires_grad_(True)))
+    model.layer3.apply(lambda m: m.register_forward_hook(lambda m, _, output: output.requires_grad_(True)))
+    model.layer4.apply(lambda m: m.register_forward_hook(lambda m, _, output: output.requires_grad_(True)))
+    
+    # Memory-efficient model modifications with reduced regularization
     model.layer1 = nn.Sequential(
         model.layer1,
-        nn.Dropout(0.3),
-        nn.BatchNorm2d(256)
+        nn.Dropout(0.2),
+        nn.BatchNorm2d(256, momentum=0.1)  # Reduced momentum
     )
     model.layer2 = nn.Sequential(
         model.layer2,
-        nn.Dropout(0.3),
-        nn.BatchNorm2d(512)
+        nn.Dropout(0.2),
+        nn.BatchNorm2d(512, momentum=0.1)
     )
     model.layer3 = nn.Sequential(
         model.layer3,
-        nn.Dropout(0.4),
-        nn.BatchNorm2d(1024)
+        nn.Dropout(0.3),
+        nn.BatchNorm2d(1024, momentum=0.1)
     )
     model.layer4 = nn.Sequential(
         model.layer4,
-        nn.Dropout(0.4),
-        nn.BatchNorm2d(2048)
+        nn.Dropout(0.3),
+        nn.BatchNorm2d(2048, momentum=0.1)
     )
     
-    def init_weights(m):
-        if isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.BatchNorm2d):
-            nn.init.constant_(m.weight, 1.0)
-            nn.init.constant_(m.bias, 0.0)
-        elif isinstance(m, nn.Linear):
-            nn.init.xavier_normal_(m.weight)
-            nn.init.zeros_(m.bias)
-    
-    model.apply(init_weights)
     model = model.to(device)
+    
+    # Use mixed precision training
+    scaler = torch.cuda.amp.GradScaler()
     
     # Cross entropy loss with label smoothing
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
@@ -422,7 +421,7 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
     for name, layer in model.named_children():
         logging.info(f"{name}: {layer}")
     
-    # Training loop
+    # Training loop with mixed precision
     best_val_acc = 0.0
     train_losses = []
     val_losses = []
@@ -442,36 +441,39 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
         running_loss = 0.0
         correct = 0
         total = 0
-        optimizer.zero_grad()  # Zero gradients at start of epoch
+        optimizer.zero_grad(set_to_none=True)  # More memory efficient
         
-        # Training phase
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
         for batch_idx, (inputs, targets) in enumerate(pbar):
             inputs, targets = inputs.to(device), targets.to(device)
             
-            # Forward pass
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-            loss = loss / accumulation_steps  # Normalize loss
+            # Mixed precision forward pass
+            with torch.cuda.amp.autocast():
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss = loss / accumulation_steps
             
-            # Backward pass
-            loss.backward()
+            # Mixed precision backward pass
+            scaler.scale(loss).backward()
             
-            # Gradient accumulation
             if (batch_idx + 1) % accumulation_steps == 0:
-                # Clip gradients
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad()
-                
-                # Update learning rate
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
             
             # Update metrics
             running_loss += loss.item() * accumulation_steps
-            _, predicted = outputs.max(1)
-            total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
+            with torch.no_grad():
+                _, predicted = outputs.max(1)
+                total += targets.size(0)
+                correct += predicted.eq(targets).sum().item()
+            
+            # Clear cache more frequently
+            if batch_idx % 20 == 0:
+                torch.cuda.empty_cache()
             
             # Update progress bar
             train_acc = 100. * correct / total
@@ -479,15 +481,8 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
                 'loss': running_loss / (batch_idx + 1),
                 'acc': f'{train_acc:.2f}%'
             })
-            
-            # Clear cache periodically
-            if batch_idx % 50 == 0:
-                torch.cuda.empty_cache()
         
-        train_loss = running_loss / len(train_loader)
-        train_acc = 100. * correct / total
-        
-        # Validation phase
+        # Validation phase with memory optimization
         model.eval()
         val_loss = 0.0
         correct = 0
@@ -496,24 +491,26 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
         with torch.no_grad():
             for inputs, targets in tqdm(val_loader, desc='Validation'):
                 inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
+                
+                with torch.cuda.amp.autocast():
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
                 
                 val_loss += loss.item()
                 _, predicted = outputs.max(1)
                 total += targets.size(0)
                 correct += predicted.eq(targets).sum().item()
                 
-                # Clear cache periodically
+                # Clear cache more frequently
                 torch.cuda.empty_cache()
-        
+                
         val_loss = val_loss / len(val_loader)
         val_acc = 100. * correct / total
         
         # Save metrics
-        train_losses.append(train_loss)
+        train_losses.append(running_loss / len(train_loader))
         val_losses.append(val_loss)
-        train_accs.append(train_acc)
+        train_accs.append(100. * correct / total)
         val_accs.append(val_acc)
         
         # Check if target accuracy is met
@@ -521,13 +518,13 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
         
         # Log results
         logging.info(f'Epoch {epoch+1:3d}/{num_epochs} - '
-                    f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, '
+                    f'Train Loss: {running_loss / len(train_loader):.4f}, Train Acc: {100. * correct / total:.2f}%, '
                     f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
         
         # Save to markdown file
         try:
             with open(log_file, "a") as f:
-                f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
+                f.write(f"| {epoch+1:5d} | {running_loss / len(train_loader):.4f} | {100. * correct / total:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
             logging.info(f"Saved logs for epoch {epoch+1} to {log_file}")
         except Exception as e:
             logging.error(f"Failed to save logs for epoch {epoch+1}: {str(e)}")
@@ -540,9 +537,9 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'train_loss': train_loss,
+                'train_loss': running_loss / len(train_loader),
                 'val_loss': val_loss,
-                'train_acc': train_acc,
+                'train_acc': 100. * correct / total,
                 'val_acc': val_acc,
             }, f'best_model_{timestamp}.pth')
             
