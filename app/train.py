@@ -270,10 +270,11 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
     logs_dir = os.path.join(os.getcwd(), 'logs')
     os.makedirs(logs_dir, exist_ok=True)
     
-    # Set up log file path
+    # Set up single log file path
     log_file = os.path.join(logs_dir, f"training_log_{timestamp}.md")
+    logging.info(f"Training logs will be saved to: {log_file}")
     
-    # Initialize markdown log file
+    # Initialize markdown log file once
     with open(log_file, "w") as f:
         f.write("# ImageNet Training Log\n\n")
         f.write("## Training Configuration\n")
@@ -285,8 +286,6 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
         f.write("## Training Progress\n\n")
         f.write("| Epoch | Train Loss | Train Acc | Val Loss | Val Acc | Target Met |\n")
         f.write("|-------|------------|-----------|----------|----------|------------|\n")
-    
-    logging.info(f"Training logs will be saved to: {log_file}")
     
     # Get S3 bucket info from environment
     bucket_name = os.getenv("S3_BUCKET_NAME")
@@ -435,19 +434,14 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
     
     logging.info("Starting training...")
     
-    # Create markdown file for logging
-    log_file = f"training_log_{timestamp}.md"
-    with open(log_file, "w") as f:
-        f.write("| Epoch | Train Loss | Train Acc | Val Loss | Val Acc | Target Met |\n")
-        f.write("|-------|------------|-----------|----------|----------|------------|\n")
-    
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
         correct = 0
         total = 0
-        optimizer.zero_grad(set_to_none=True)  # More memory efficient
+        optimizer.zero_grad(set_to_none=True)
         
+        # Training phase
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
         for batch_idx, (inputs, targets) in enumerate(pbar):
             inputs, targets = inputs.to(device), targets.to(device)
@@ -487,11 +481,15 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
                 'acc': f'{train_acc:.2f}%'
             })
         
-        # Validation phase with memory optimization
+        # Calculate training metrics
+        train_loss = running_loss / len(train_loader)
+        train_acc = 100. * correct / total
+        
+        # Validation phase
         model.eval()
         val_loss = 0.0
-        correct = 0
-        total = 0
+        val_correct = 0
+        val_total = 0
         
         with torch.no_grad():
             for inputs, targets in tqdm(val_loader, desc='Validation'):
@@ -503,36 +501,32 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
                 
                 val_loss += loss.item()
                 _, predicted = outputs.max(1)
-                total += targets.size(0)
-                correct += predicted.eq(targets).sum().item()
+                val_total += targets.size(0)
+                val_correct += predicted.eq(targets).sum().item()
                 
                 # Clear cache more frequently
                 torch.cuda.empty_cache()
                 
+        # Calculate validation metrics
         val_loss = val_loss / len(val_loader)
-        val_acc = 100. * correct / total
-        
-        # Save metrics
-        train_losses.append(running_loss / len(train_loader))
-        val_losses.append(val_loss)
-        train_accs.append(100. * correct / total)
-        val_accs.append(val_acc)
+        val_acc = 100. * val_correct / val_total
         
         # Check if target accuracy is met
         target_met = "✓" if val_acc >= 75.0 else "✗"
         
-        # Log results
-        logging.info(f'Epoch {epoch+1:3d}/{num_epochs} - '
-                    f'Train Loss: {running_loss / len(train_loader):.4f}, Train Acc: {100. * correct / total:.2f}%, '
-                    f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+        # Save metrics
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
         
-        # Save to markdown file
-        try:
-            with open(log_file, "a") as f:
-                f.write(f"| {epoch+1:5d} | {running_loss / len(train_loader):.4f} | {100. * correct / total:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
-            logging.info(f"Saved logs for epoch {epoch+1} to {log_file}")
-        except Exception as e:
-            logging.error(f"Failed to save logs for epoch {epoch+1}: {str(e)}")
+        # Log results to both console and file
+        log_message = f'Epoch {epoch+1:3d}/{num_epochs} - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%'
+        logging.info(log_message)
+        
+        # Append to the single log file
+        with open(log_file, "a") as f:
+            f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
         
         # Save best model
         if val_acc > best_val_acc:
@@ -542,27 +536,22 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'train_loss': running_loss / len(train_loader),
+                'train_loss': train_loss,
                 'val_loss': val_loss,
-                'train_acc': 100. * correct / total,
+                'train_acc': train_acc,
                 'val_acc': val_acc,
             }, f'best_model_{timestamp}.pth')
-            
             logging.info(f'New best model saved with validation accuracy: {val_acc:.2f}%')
         
         # Clear cache at end of epoch
         torch.cuda.empty_cache()
     
-    # Add final summary to log file
-    try:
-        with open(log_file, "a") as f:
-            f.write("\n## Training Summary\n\n")
-            f.write(f"- Best Validation Accuracy: {best_val_acc:.2f}%\n")
-            f.write(f"- Target Accuracy (75.0%) {'Achieved' if best_val_acc >= 75.0 else 'Not Achieved'}\n")
-            f.write(f"- Total Training Time: {time.time() - start_time:.2f} seconds\n")
-        logging.info(f"Training summary saved to {log_file}")
-    except Exception as e:
-        logging.error(f"Failed to save training summary: {str(e)}")
+    # Add final summary to the same log file
+    with open(log_file, "a") as f:
+        f.write("\n## Training Summary\n\n")
+        f.write(f"- Best Validation Accuracy: {best_val_acc:.2f}%\n")
+        f.write(f"- Target Accuracy (75.0%) {'Achieved' if best_val_acc >= 75.0 else 'Not Achieved'}\n")
+        f.write(f"- Total Training Time: {time.time() - start_time:.2f} seconds\n")
     
     return train_losses, val_losses, train_accs, val_accs
 
