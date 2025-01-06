@@ -415,10 +415,10 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
         max_lr=learning_rate,
         epochs=num_epochs,
         steps_per_epoch=len(train_loader),
-        pct_start=0.1,
+        pct_start=0.05,  # 5% warmup
         anneal_strategy='cos',
-        div_factor=10,
-        final_div_factor=100
+        div_factor=25,  # Initial learning rate = max_lr/25
+        final_div_factor=1e4  # Final learning rate = max_lr/(25*1e4)
     )
     
     # Print model summary
@@ -465,8 +465,8 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 scaler.step(optimizer)
-                scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                scaler.update()
                 scheduler.step()
             
             # Update metrics
