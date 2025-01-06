@@ -453,7 +453,7 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
             inputs, targets = inputs.to(device), targets.to(device)
             
             # Mixed precision forward pass
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 loss = loss / accumulation_steps
@@ -465,8 +465,8 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 scaler.step(optimizer)
-                optimizer.zero_grad(set_to_none=True)
                 scaler.update()
+                optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
             
             # Update metrics
@@ -497,7 +497,7 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
             for inputs, targets in tqdm(val_loader, desc='Validation'):
                 inputs, targets = inputs.to(device), targets.to(device)
                 
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
                 
