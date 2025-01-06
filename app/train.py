@@ -353,6 +353,9 @@ def train_model(num_epochs=100, batch_size=8, learning_rate=0.0005):
     )
     
     # Initialize model with gradient checkpointing
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Using device: {device}")
+    
     model = models.resnet50(weights=None)
     model.train()
     
