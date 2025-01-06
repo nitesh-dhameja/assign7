@@ -244,25 +244,22 @@ def save_training_log(epoch, train_loss, train_acc, val_loss, val_acc, timestamp
         target_met = "✅" if val_acc >= 75.0 else "❌"
         f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
 
-def train_model(num_epochs=100, batch_size=8, learning_rate=0.0005):
+def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
     # Track start time
     start_time = time.time()
     
     # Define training configuration
-    accumulation_steps = 8  # Increased accumulation steps to maintain effective batch size
+    accumulation_steps = 4  # Reduced accumulation steps since we have more memory
     effective_batch_size = batch_size * accumulation_steps
-    max_grad_norm = 1.0  # For gradient clipping
+    max_grad_norm = 1.0
     
     # Set memory management for CUDA
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        # Set memory allocator settings for better memory management
-        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
-        torch.cuda.set_per_process_memory_fraction(0.5)  # Further reduced memory fraction
-        torch.backends.cudnn.benchmark = False  # Disable benchmark for more stable memory usage
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:256,expandable_segments:True'
+        torch.cuda.set_per_process_memory_fraction(0.85)  # Increased memory fraction
+        torch.backends.cudnn.benchmark = True  # Enable benchmark mode
         torch.backends.cudnn.deterministic = True
-        
-        # Enable gradient checkpointing for memory efficiency
         torch.backends.cudnn.enabled = True
         torch.cuda.empty_cache()
     
@@ -330,26 +327,26 @@ def train_model(num_epochs=100, batch_size=8, learning_rate=0.0005):
     num_classes = len(train_dataset.class_to_idx)
     logging.info(f"Number of classes: {num_classes}")
     
-    # DataLoader with minimal workers
+    # DataLoader with increased workers
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=1,  # Reduced workers
-        pin_memory=False,  # Disabled pin_memory
+        num_workers=4,  # Increased workers
+        pin_memory=True,  # Enabled pin_memory
         drop_last=True,
-        persistent_workers=False,  # Disabled persistent workers
-        prefetch_factor=1  # Minimal prefetch
+        persistent_workers=True,  # Enabled persistent workers
+        prefetch_factor=2  # Increased prefetch
     )
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
+        batch_size=batch_size * 2,  # Larger validation batch size
         shuffle=False,
-        num_workers=1,
-        pin_memory=False,
-        persistent_workers=False,
-        prefetch_factor=1
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2
     )
     
     # Initialize model with gradient checkpointing
@@ -359,34 +356,42 @@ def train_model(num_epochs=100, batch_size=8, learning_rate=0.0005):
     model = models.resnet50(weights=None)
     model.train()
     
-    # Enable gradient checkpointing
-    model.layer1.apply(lambda m: m.register_forward_hook(lambda m, _, output: output.requires_grad_(True)))
-    model.layer2.apply(lambda m: m.register_forward_hook(lambda m, _, output: output.requires_grad_(True)))
-    model.layer3.apply(lambda m: m.register_forward_hook(lambda m, _, output: output.requires_grad_(True)))
-    model.layer4.apply(lambda m: m.register_forward_hook(lambda m, _, output: output.requires_grad_(True)))
-    
-    # Memory-efficient model modifications with reduced regularization
+    # Memory-efficient model modifications with balanced regularization
     model.layer1 = nn.Sequential(
         model.layer1,
-        nn.Dropout(0.2),
-        nn.BatchNorm2d(256, momentum=0.1)  # Reduced momentum
+        nn.Dropout(0.3),
+        nn.BatchNorm2d(256, momentum=0.1, eps=1e-5)
     )
     model.layer2 = nn.Sequential(
         model.layer2,
-        nn.Dropout(0.2),
-        nn.BatchNorm2d(512, momentum=0.1)
+        nn.Dropout(0.3),
+        nn.BatchNorm2d(512, momentum=0.1, eps=1e-5)
     )
     model.layer3 = nn.Sequential(
         model.layer3,
-        nn.Dropout(0.3),
-        nn.BatchNorm2d(1024, momentum=0.1)
+        nn.Dropout(0.4),
+        nn.BatchNorm2d(1024, momentum=0.1, eps=1e-5)
     )
     model.layer4 = nn.Sequential(
         model.layer4,
-        nn.Dropout(0.3),
-        nn.BatchNorm2d(2048, momentum=0.1)
+        nn.Dropout(0.4),
+        nn.BatchNorm2d(2048, momentum=0.1, eps=1e-5)
     )
     
+    # Initialize weights with improved method
+    def init_weights(m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, nn.Linear):
+            nn.init.xavier_normal_(m.weight)
+            nn.init.zeros_(m.bias)
+    
+    model.apply(init_weights)
     model = model.to(device)
     
     # Use mixed precision training
@@ -395,28 +400,25 @@ def train_model(num_epochs=100, batch_size=8, learning_rate=0.0005):
     # Cross entropy loss with label smoothing
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
-    # Optimizer with stronger regularization
+    # Optimizer with improved settings
     optimizer = optim.AdamW(
         model.parameters(),
         lr=learning_rate,
         betas=(0.9, 0.999),
         eps=1e-8,
-        weight_decay=0.1  # Increased weight decay
+        weight_decay=0.05  # Balanced weight decay
     )
     
     # Learning rate scheduler with warmup and cosine decay
-    num_steps = len(train_loader) * num_epochs
-    warmup_steps = len(train_loader) * 5  # 5 epochs warmup
-    
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=learning_rate,
         epochs=num_epochs,
         steps_per_epoch=len(train_loader),
-        pct_start=0.1,  # 10% warmup
+        pct_start=0.1,
         anneal_strategy='cos',
-        div_factor=25,
-        final_div_factor=1000
+        div_factor=10,
+        final_div_factor=100
     )
     
     # Print model summary
