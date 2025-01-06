@@ -248,6 +248,11 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
     # Track start time
     start_time = time.time()
     
+    # Define training configuration
+    accumulation_steps = 4  # Accumulate gradients over 4 steps
+    effective_batch_size = batch_size * accumulation_steps
+    max_grad_norm = 1.0  # For gradient clipping
+    
     # Set memory management for CUDA
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -387,14 +392,6 @@ def train_model(num_epochs=100, batch_size=16, learning_rate=0.0005):
     
     # Cross entropy loss with label smoothing
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    
-    # Gradient accumulation steps
-    accumulation_steps = 4  # Accumulate gradients over 4 steps
-    effective_batch_size = batch_size * accumulation_steps
-    logging.info(f"Using gradient accumulation. Effective batch size: {effective_batch_size}")
-    
-    # Set gradient clipping
-    max_grad_norm = 1.0
     
     # Optimizer with stronger regularization
     optimizer = optim.AdamW(
