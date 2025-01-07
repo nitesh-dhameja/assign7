@@ -244,21 +244,21 @@ def save_training_log(epoch, train_loss, train_acc, val_loss, val_acc, timestamp
         target_met = "✅" if val_acc >= 75.0 else "❌"
         f.write(f"| {epoch+1:5d} | {train_loss:.4f} | {train_acc:.2f}% | {val_loss:.4f} | {val_acc:.2f}% | {target_met} |\n")
 
-def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
+def train_model(num_epochs=100, batch_size=64, learning_rate=0.01):
     # Track start time
     start_time = time.time()
     
     # Define training configuration
-    accumulation_steps = 4  # Reduced accumulation steps since we have more memory
+    accumulation_steps = 2  # Reduced accumulation steps for faster updates
     effective_batch_size = batch_size * accumulation_steps
-    max_grad_norm = 1.0
+    max_grad_norm = 5.0  # Increased gradient clipping threshold
     
     # Set memory management for CUDA
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:256,expandable_segments:True'
-        torch.cuda.set_per_process_memory_fraction(0.85)  # Increased memory fraction
-        torch.backends.cudnn.benchmark = True  # Enable benchmark mode
+        torch.cuda.set_per_process_memory_fraction(0.85)
+        torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.enabled = True
         torch.cuda.empty_cache()
@@ -293,22 +293,22 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
         raise ValueError("S3_BUCKET_NAME environment variable is not set")
     logging.info(f"Using S3 bucket: {bucket_name}")
     
-    # Memory-efficient transforms with stronger augmentation
+    # Memory-efficient transforms with balanced augmentation
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),
+        transforms.RandomResizedCrop(224, scale=(0.2, 1.0)),  # Increased scale range
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(p=0.2),
-        transforms.RandomRotation(15),
+        transforms.RandomRotation(30),  # Increased rotation
         transforms.ColorJitter(
-            brightness=0.4,
-            contrast=0.4,
-            saturation=0.4,
+            brightness=0.5,
+            contrast=0.5,
+            saturation=0.5,
             hue=0.2
         ),
-        transforms.RandomAffine(degrees=15, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+        transforms.RandomAffine(degrees=30, translate=(0.2, 0.2), scale=(0.8, 1.2)),  # Stronger affine
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        transforms.RandomErasing(p=0.3)
+        transforms.RandomErasing(p=0.5)  # Increased erasing probability
     ])
     
     val_transform = transforms.Compose([
@@ -355,10 +355,10 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
     model = models.resnet50(weights=None)
     model.train()
     
-    # Memory-efficient model modifications with balanced regularization
+    # Memory-efficient model modifications with stronger regularization
     model.layer1 = nn.Sequential(
         model.layer1,
-        nn.Dropout(0.3),
+        nn.Dropout(0.2),  # Reduced dropout
         nn.BatchNorm2d(256, momentum=0.1, eps=1e-5)
     )
     model.layer2 = nn.Sequential(
@@ -368,7 +368,7 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
     )
     model.layer3 = nn.Sequential(
         model.layer3,
-        nn.Dropout(0.4),
+        nn.Dropout(0.3),
         nn.BatchNorm2d(1024, momentum=0.1, eps=1e-5)
     )
     model.layer4 = nn.Sequential(
@@ -396,28 +396,28 @@ def train_model(num_epochs=100, batch_size=32, learning_rate=0.001):
     # Use mixed precision training
     scaler = torch.cuda.amp.GradScaler()
     
-    # Cross entropy loss with label smoothing
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # Cross entropy loss with reduced label smoothing
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)  # Reduced label smoothing
     
-    # Optimizer with improved settings
-    optimizer = optim.AdamW(
+    # Optimizer with SGD and momentum
+    optimizer = optim.SGD(
         model.parameters(),
         lr=learning_rate,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=0.05  # Balanced weight decay
+        momentum=0.9,
+        weight_decay=1e-4,  # Reduced weight decay
+        nesterov=True
     )
     
-    # Learning rate scheduler with warmup and cosine decay
+    # Learning rate scheduler with longer warmup
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=learning_rate,
         epochs=num_epochs,
         steps_per_epoch=len(train_loader),
-        pct_start=0.05,  # 5% warmup
+        pct_start=0.1,  # 10% warmup
         anneal_strategy='cos',
-        div_factor=25,  # Initial learning rate = max_lr/25
-        final_div_factor=1e4  # Final learning rate = max_lr/(25*1e4)
+        div_factor=10,  # Less aggressive initial LR reduction
+        final_div_factor=100  # Less aggressive final LR
     )
     
     # Print model summary
