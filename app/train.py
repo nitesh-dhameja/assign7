@@ -348,67 +348,80 @@ def train_model(num_epochs=100, batch_size=64, learning_rate=0.01):
         prefetch_factor=2
     )
     
-    # Initialize model with gradient checkpointing
+    # Initialize model from scratch
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
     
     model = models.resnet50(weights=None)
-    model.train()
     
-    # Memory-efficient model modifications with stronger regularization
-    model.layer1 = nn.Sequential(
-        model.layer1,
-        nn.Dropout(0.2),  # Reduced dropout
-        nn.BatchNorm2d(256, momentum=0.1, eps=1e-5)
-    )
-    model.layer2 = nn.Sequential(
-        model.layer2,
-        nn.Dropout(0.3),
-        nn.BatchNorm2d(512, momentum=0.1, eps=1e-5)
-    )
-    model.layer3 = nn.Sequential(
-        model.layer3,
-        nn.Dropout(0.3),
-        nn.BatchNorm2d(1024, momentum=0.1, eps=1e-5)
-    )
-    model.layer4 = nn.Sequential(
-        model.layer4,
-        nn.Dropout(0.4),
-        nn.BatchNorm2d(2048, momentum=0.1, eps=1e-5)
-    )
-    
-    # Initialize weights with improved method
+    # Initialize weights properly
     def init_weights(m):
         if isinstance(m, nn.Conv2d):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
-                nn.init.zeros_(m.bias)
+                nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.BatchNorm2d):
-            nn.init.constant_(m.weight, 1.0)
-            nn.init.constant_(m.bias, 0.0)
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.Linear):
             nn.init.xavier_normal_(m.weight)
-            nn.init.zeros_(m.bias)
+            nn.init.constant_(m.bias, 0)
     
     model.apply(init_weights)
+    
+    # Add BatchNorm and Dropout to each layer
+    model.layer1 = nn.Sequential(
+        model.layer1,
+        nn.BatchNorm2d(256),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.2)
+    )
+    model.layer2 = nn.Sequential(
+        model.layer2,
+        nn.BatchNorm2d(512),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.3)
+    )
+    model.layer3 = nn.Sequential(
+        model.layer3,
+        nn.BatchNorm2d(1024),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.4)
+    )
+    model.layer4 = nn.Sequential(
+        model.layer4,
+        nn.BatchNorm2d(2048),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.5)
+    )
+    
+    # Modify final classifier
+    model.fc = nn.Sequential(
+        nn.Linear(2048, 1024),
+        nn.BatchNorm1d(1024),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.5),
+        nn.Linear(1024, num_classes)
+    )
+    
     model = model.to(device)
     
     # Use mixed precision training
     scaler = torch.cuda.amp.GradScaler()
     
     # Cross entropy loss with reduced label smoothing
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)  # Reduced label smoothing
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
     
     # Optimizer with SGD and momentum
     optimizer = optim.SGD(
         model.parameters(),
         lr=learning_rate,
         momentum=0.9,
-        weight_decay=1e-4,  # Reduced weight decay
+        weight_decay=1e-4,
         nesterov=True
     )
     
-    # Learning rate scheduler with longer warmup
+    # Learning rate scheduler with warmup and cosine decay
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=learning_rate,
@@ -416,8 +429,8 @@ def train_model(num_epochs=100, batch_size=64, learning_rate=0.01):
         steps_per_epoch=len(train_loader),
         pct_start=0.1,  # 10% warmup
         anneal_strategy='cos',
-        div_factor=10,  # Less aggressive initial LR reduction
-        final_div_factor=100  # Less aggressive final LR
+        div_factor=10,
+        final_div_factor=100
     )
     
     # Print model summary
