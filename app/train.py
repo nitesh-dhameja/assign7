@@ -5,8 +5,7 @@ import torch.optim as optim
 import torchvision.models as models
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast
-from torch.amp import GradScaler
+from torch.amp import autocast, GradScaler
 from datetime import datetime
 import logging
 import time
@@ -203,7 +202,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scaler, d
             inputs, targets = inputs.to(device), targets.to(device)
             
             # Mixed precision forward pass
-            with autocast(device_type='cuda', dtype=torch.float16):
+            with autocast('cuda'):
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 loss = loss / accumulation_steps
@@ -251,7 +250,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scaler, d
             for inputs, targets in tqdm(val_loader, desc='Validation'):
                 inputs, targets = inputs.to(device), targets.to(device)
                 
-                with autocast(device_type='cuda', dtype=torch.float16):
+                with autocast('cuda'):
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
                 
@@ -346,7 +345,7 @@ def main():
         weight_decay=1e-4,
         nesterov=True
     )
-    scaler = GradScaler('cuda')  # Updated to use new GradScaler syntax
+    scaler = GradScaler('cuda')  # Updated GradScaler syntax
     
     # Train model
     train_model(
