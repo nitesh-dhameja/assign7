@@ -5,7 +5,8 @@ import torch.optim as optim
 import torchvision.models as models
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import autocast
+from torch.amp import GradScaler
 from datetime import datetime
 import logging
 import time
@@ -113,22 +114,6 @@ def create_model(num_classes):
     
     return model
 
-def setup_training(model, learning_rate=0.1):
-    """
-    Set up training components (optimizer, criterion, etc.)
-    """
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(
-        model.parameters(),
-        lr=learning_rate,
-        momentum=0.9,
-        weight_decay=1e-4,
-        nesterov=True
-    )
-    scaler = GradScaler()
-    
-    return criterion, optimizer, scaler
-
 def save_training_log(log_file, epoch, train_loss, train_acc, val_loss, val_acc, current_lr=None, is_header=False):
     """
     Save training logs to a markdown file
@@ -170,7 +155,10 @@ def save_training_summary(log_file, best_val_acc, total_time):
         else:
             f.write("- Running on CPU\n")
 
-def train_model(num_epochs=100, batch_size=256, learning_rate=0.1):
+def train_model(model, train_loader, val_loader, criterion, optimizer, scaler, device, num_epochs=100, learning_rate=0.1):
+    """
+    Train the model
+    """
     # Track start time
     start_time = time.time()
     
@@ -181,14 +169,110 @@ def train_model(num_epochs=100, batch_size=256, learning_rate=0.1):
     # Initialize log file with header
     save_training_log(log_file, 0, 0, 0, 0, 0, is_header=True)
     
-    # Rest of your training configuration...
-    # ... (keep existing code) ...
+    # Training configuration
+    accumulation_steps = 4  # Effective batch size = batch_size * accumulation_steps
+    max_grad_norm = 5.0
+    warmup_epochs = 5
+    
+    # Training loop
+    best_val_acc = 0.0
+    train_losses = []
+    val_losses = []
+    train_accs = []
+    val_accs = []
     
     for epoch in range(num_epochs):
-        # ... (keep existing training loop code) ...
+        # Update learning rate
+        if epoch < warmup_epochs:
+            current_lr = learning_rate * (epoch + 1) / warmup_epochs
+        else:
+            progress = (epoch - warmup_epochs) / (num_epochs - warmup_epochs)
+            current_lr = learning_rate * 0.5 * (1 + math.cos(math.pi * progress))
         
-        # After calculating metrics for the epoch
-        current_lr = optimizer.param_groups[0]['lr']
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
+        
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        optimizer.zero_grad(set_to_none=True)
+        
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
+        for batch_idx, (inputs, targets) in enumerate(pbar):
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            # Mixed precision forward pass
+            with autocast(device_type='cuda', dtype=torch.float16):
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss = loss / accumulation_steps
+            
+            # Mixed precision backward pass
+            scaler.scale(loss).backward()
+            
+            if (batch_idx + 1) % accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+            
+            # Update metrics
+            running_loss += loss.item() * accumulation_steps
+            with torch.no_grad():
+                _, predicted = outputs.max(1)
+                total += targets.size(0)
+                correct += predicted.eq(targets).sum().item()
+            
+            # Update progress bar
+            train_acc = 100. * correct / total
+            pbar.set_postfix({
+                'loss': running_loss / (batch_idx + 1),
+                'acc': f'{train_acc:.2f}%',
+                'lr': current_lr
+            })
+            
+            # Clear cache periodically
+            if batch_idx % 50 == 0:
+                torch.cuda.empty_cache()
+        
+        # Calculate training metrics
+        train_loss = running_loss / len(train_loader)
+        train_acc = 100. * correct / total
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        
+        with torch.no_grad():
+            for inputs, targets in tqdm(val_loader, desc='Validation'):
+                inputs, targets = inputs.to(device), targets.to(device)
+                
+                with autocast(device_type='cuda', dtype=torch.float16):
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                val_total += targets.size(0)
+                val_correct += predicted.eq(targets).sum().item()
+                
+                torch.cuda.empty_cache()
+        
+        # Calculate validation metrics
+        val_loss = val_loss / len(val_loader)
+        val_acc = 100. * val_correct / val_total
+        
+        # Save metrics
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_accs.append(train_acc)
+        val_accs.append(val_acc)
+        
+        # Save logs
         save_training_log(
             log_file,
             epoch + 1,
@@ -199,7 +283,22 @@ def train_model(num_epochs=100, batch_size=256, learning_rate=0.1):
             current_lr
         )
         
-        # ... (keep rest of the epoch code) ...
+        # Save best model
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'train_acc': train_acc,
+                'val_acc': val_acc,
+            }, f'best_model_{timestamp}.pth')
+            logging.info(f'New best model saved with validation accuracy: {val_acc:.2f}%')
+        
+        # Clear cache
+        torch.cuda.empty_cache()
     
     # Save final summary
     total_time = time.time() - start_time
@@ -239,7 +338,15 @@ def main():
     
     # Create and initialize model
     model = create_model(num_classes).to(device)
-    criterion, optimizer, scaler = setup_training(model, config['learning_rate'])
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(
+        model.parameters(),
+        lr=config['learning_rate'],
+        momentum=0.9,
+        weight_decay=1e-4,
+        nesterov=True
+    )
+    scaler = GradScaler('cuda')  # Updated to use new GradScaler syntax
     
     # Train model
     train_model(
