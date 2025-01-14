@@ -5,6 +5,15 @@ import torch.nn as nn
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from datetime import datetime
+from torchvision import transforms
+from s3_dataset import S3ImageNetDataset
+import torchvision.models as models
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 def save_training_log(log_file, epoch, train_loss, train_acc, val_loss, val_acc, lr, is_header=False):
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
@@ -165,4 +174,70 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scaler, d
     )
     
     return train_losses, train_accs, val_losses, val_accs
+
+def main():
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logging.info(f'Using device: {device}')
+
+    # Set up data transforms
+    train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(224),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    # Create datasets
+    bucket_name = os.getenv('S3_BUCKET_NAME')
+    if not bucket_name:
+        raise ValueError("S3_BUCKET_NAME environment variable not set")
+
+    logging.info("Creating datasets...")
+    train_dataset = S3ImageNetDataset(bucket_name=bucket_name, transform=train_transform, is_train=True)
+    val_dataset = S3ImageNetDataset(bucket_name=bucket_name, transform=val_transform, is_train=False)
+
+    # Create data loaders
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=32, shuffle=True,
+        num_workers=4, pin_memory=True
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=32, shuffle=False,
+        num_workers=4, pin_memory=True
+    )
+
+    # Create model
+    logging.info("Creating model...")
+    model = models.resnet50(weights=None)  # Training from scratch
+    model = model.to(device)
+
+    # Set up training
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.05)
+    scaler = GradScaler()
+
+    # Train model
+    logging.info("Starting training...")
+    train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scaler=scaler,
+        device=device,
+        num_epochs=100
+    )
+
+if __name__ == '__main__':
+    main()
 
