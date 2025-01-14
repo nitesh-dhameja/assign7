@@ -8,6 +8,10 @@ from datetime import datetime
 from torchvision import transforms
 from s3_dataset import S3ImageNetDataset
 import torchvision.models as models
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
