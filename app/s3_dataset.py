@@ -1,15 +1,17 @@
 import os
+import io
 import torch
 from torch.utils.data import Dataset
 import boto3
 from PIL import Image
-import io
 import logging
 import time
 import pyarrow.parquet as pq
 import pyarrow as pa
+import pyarrow.ipc as ipc
 from botocore.exceptions import ClientError
 from tqdm import tqdm
+import tarfile
 
 class S3ImageNetDataset(Dataset):
     def __init__(self, bucket_name, transform=None, is_train=True, max_retries=3, retry_delay=1):
@@ -153,6 +155,67 @@ class S3ImageNetDataset(Dataset):
     def __len__(self):
         return self.cumulative_sizes[-1]
 
+    def process_arrow_file(self, response):
+        """
+        Process an Arrow file from S3 response
+        """
+        try:
+            # Read the Arrow file
+            stream = ipc.open_stream(response['Body'])
+            batch = next(stream)
+            
+            if batch is not None and 'label' in batch.schema.names:
+                labels = batch['label'].to_numpy()
+                num_records = len(batch)
+                return labels, num_records
+            return [], 0
+        except Exception as e:
+            logging.error(f"Error processing Arrow file: {str(e)}")
+            return [], 0
+
+    def process_tar_file(self, response, file_path):
+        """
+        Process a tar.gz file from S3 response
+        """
+        try:
+            # Create a BytesIO object from the response body
+            tar_bytes = io.BytesIO(response['Body'].read())
+            with tarfile.open(fileobj=tar_bytes, mode='r:gz') as tar:
+                # Count image files
+                image_files = [f for f in tar.getmembers() if f.name.lower().endswith(('.jpeg', '.jpg', '.png'))]
+                # Extract class ID from file path
+                class_id = int(file_path.split('/')[-1].split('_')[1].split('.')[0])
+                return [class_id], len(image_files)
+        except Exception as e:
+            logging.error(f"Error processing tar file: {str(e)}")
+            return [], 0
+
+    def read_image_from_arrow(self, batch, record_idx):
+        """
+        Read an image from an Arrow batch
+        """
+        try:
+            image_data = batch['image'][record_idx]['bytes'].as_buffer()
+            label = batch['label'][record_idx].as_py()
+            image = Image.open(io.BytesIO(image_data)).convert('RGB')
+            return image, label
+        except Exception as e:
+            logging.error(f"Error reading image from Arrow batch: {str(e)}")
+            raise
+
+    def read_image_from_tar(self, tar_bytes, image_file):
+        """
+        Read an image from a tar file
+        """
+        try:
+            with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r:gz') as tar:
+                image_data = tar.extractfile(image_file).read()
+                image = Image.open(io.BytesIO(image_data)).convert('RGB')
+                return image
+        except Exception as e:
+            logging.error(f"Error reading image from tar file: {str(e)}")
+            raise
+
     def __getitem__(self, idx):
         # Find which file contains this index
         file_idx = next(i for i, size in enumerate(self.cumulative_sizes[1:], 1) 
@@ -167,35 +230,26 @@ class S3ImageNetDataset(Dataset):
                 
                 if data_file.endswith('.arrow'):
                     # Process Arrow file
-                    stream = pa.ipc.open_stream(response['Body'])
+                    stream = ipc.open_stream(response['Body'])
                     current_idx = 0
                     for batch in stream:
                         if batch is not None:
                             batch_size = len(batch)
                             if current_idx + batch_size > local_idx:
                                 record_idx = local_idx - current_idx
-                                image_data = batch['image'][record_idx]['bytes'].as_buffer()
-                                label = batch['label'][record_idx].as_py()
+                                image, label = self.read_image_from_arrow(batch, record_idx)
                                 break
                             current_idx += batch_size
                 else:
                     # Process tar.gz file
-                    import tarfile
-                    import io
-                    tar = tarfile.open(fileobj=io.BytesIO(response['Body'].read()))
-                    image_files = [f for f in tar.getmembers() if f.name.endswith(('.JPEG', '.jpg', '.jpeg'))]
-                    if local_idx >= len(image_files):
-                        raise ValueError(f"Index {local_idx} out of range for {data_file}")
-                    image_file = image_files[local_idx]
-                    image_data = tar.extractfile(image_file).read()
-                    # Extract class ID from file path
-                    label = int(data_file.split('/')[-1].split('_')[1].split('.')[0])
-                
-                # Convert to PIL Image
-                try:
-                    image = Image.open(io.BytesIO(image_data)).convert('RGB')
-                except Exception as e:
-                    raise ValueError(f"Failed to decode image: {str(e)}")
+                    tar_bytes = response['Body'].read()
+                    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode='r:gz') as tar:
+                        image_files = [f for f in tar.getmembers() if f.name.lower().endswith(('.jpeg', '.jpg', '.png'))]
+                        if local_idx >= len(image_files):
+                            raise ValueError(f"Index {local_idx} out of range for {data_file}")
+                        image_file = image_files[local_idx]
+                        image = self.read_image_from_tar(tar_bytes, image_file)
+                        label = int(data_file.split('/')[-1].split('_')[1].split('.')[0])
                 
                 # Apply transforms
                 if self.transform:
