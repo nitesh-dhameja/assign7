@@ -61,7 +61,7 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, e
             
             optimizer.zero_grad()
             
-            with autocast('cuda'):
+            with autocast(enabled=True, device_type='cuda'):
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
             
@@ -97,8 +97,9 @@ def validate(model, val_loader, criterion, device):
             try:
                 inputs, targets = inputs.to(device), targets.to(device)
                 
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
+                with autocast(enabled=True, device_type='cuda'):
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
                 
                 running_loss += loss.item()
                 _, predicted = outputs.max(1)
