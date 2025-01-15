@@ -48,7 +48,7 @@ def save_training_summary(log_file, best_acc, train_losses, train_accs, val_loss
             f.write(f"Epoch {epoch:3d}: Train Loss={tl:.4f}, Train Acc={ta:.2f}%, Val Loss={vl:.4f}, Val Acc={va:.2f}%\n")
         f.write("```\n")
 
-def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, epoch):
+def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch):
     model.train()
     running_loss = 0.0
     correct = 0
@@ -61,22 +61,30 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, e
             
             optimizer.zero_grad()
             
-            with autocast():
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
+            # Forward pass
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
             
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            # Backward pass
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # Optimizer step
+            optimizer.step()
+            scheduler.step()
             
             running_loss += loss.item()
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
             
+            # Update progress bar
             progress_bar.set_postfix({
                 'Loss': running_loss/(batch_idx+1),
-                'Acc': 100.*correct/total
+                'Acc': 100.*correct/total,
+                'LR': scheduler.get_last_lr()[0]
             })
             
         except Exception as e:
@@ -97,9 +105,8 @@ def validate(model, val_loader, criterion, device):
             try:
                 inputs, targets = inputs.to(device), targets.to(device)
                 
-                with autocast():
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
                 
                 running_loss += loss.item()
                 _, predicted = outputs.max(1)
@@ -117,7 +124,7 @@ def validate(model, val_loader, criterion, device):
     
     return running_loss/len(val_loader), 100.*correct/total
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, scaler, device, num_epochs=100):
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, num_epochs=100):
     best_acc = 0
     train_losses = []
     train_accs = []
@@ -126,11 +133,15 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scaler, d
     
     for epoch in range(num_epochs):
         try:
+            # Training phase
             train_loss, train_acc = train_one_epoch(
-                model, train_loader, criterion, optimizer, scaler, device, epoch
+                model, train_loader, criterion, optimizer, scheduler, device, epoch
             )
+            
+            # Validation phase
             val_loss, val_acc = validate(model, val_loader, criterion, device)
             
+            # Store metrics
             train_losses.append(train_loss)
             train_accs.append(train_acc)
             val_losses.append(val_loss)
@@ -141,6 +152,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scaler, d
                 logging.info(f'Saving checkpoint... Validation Accuracy: {val_acc}%')
                 state = {
                     'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
                     'acc': val_acc,
                     'epoch': epoch,
                 }
@@ -150,7 +163,11 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scaler, d
                 best_acc = val_acc
             
             # Log metrics
-            logging.info(f'Epoch {epoch}: Train Loss: {train_loss:.3f} | Train Acc: {train_acc:.3f}% | Val Loss: {val_loss:.3f} | Val Acc: {val_acc:.3f}%')
+            logging.info(
+                f'Epoch {epoch}: Train Loss: {train_loss:.3f} | '
+                f'Train Acc: {train_acc:.3f}% | Val Loss: {val_loss:.3f} | '
+                f'Val Acc: {val_acc:.3f}% | LR: {scheduler.get_last_lr()[0]:.6f}'
+            )
             
             # Save training log
             save_training_log(
@@ -160,7 +177,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scaler, d
                 train_acc=train_acc,
                 val_loss=val_loss,
                 val_acc=val_acc,
-                lr=optimizer.param_groups[0]['lr'],
+                lr=scheduler.get_last_lr()[0],
                 is_header=(epoch == 0)
             )
             
@@ -185,13 +202,21 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device: {device}')
 
-    # Set up data transforms
+    # Set up data transforms with stronger augmentation
     train_transform = transforms.Compose([
-        transforms.RandomResizedCrop(224),
+        transforms.RandomResizedCrop(224, scale=(0.08, 1.0)),
         transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4),
+        transforms.ColorJitter(
+            brightness=0.4,
+            contrast=0.4,
+            saturation=0.4,
+            hue=0.2
+        ),
+        transforms.RandomAffine(degrees=15, translate=(0.1, 0.1)),
+        transforms.RandomPerspective(distortion_scale=0.2, p=0.5),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.3)
     ])
 
     val_transform = transforms.Compose([
@@ -210,25 +235,53 @@ def main():
     train_dataset = S3ImageNetDataset(bucket_name=bucket_name, transform=train_transform, is_train=True)
     val_dataset = S3ImageNetDataset(bucket_name=bucket_name, transform=val_transform, is_train=False)
 
-    # Create data loaders
+    # Create data loaders with larger batch size
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=32, shuffle=True,
+        train_dataset, batch_size=256, shuffle=True,
         num_workers=4, pin_memory=True
     )
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=32, shuffle=False,
+        val_dataset, batch_size=256, shuffle=False,
         num_workers=4, pin_memory=True
     )
 
-    # Create model
+    # Create model with proper initialization
     logging.info("Creating model...")
     model = models.resnet50(weights=None)  # Training from scratch
+    
+    # Initialize the weights properly
+    for m in model.modules():
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+    
     model = model.to(device)
 
-    # Set up training
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.05)
-    scaler = GradScaler()
+    # Set up training with better hyperparameters
+    criterion = nn.CrossEntropyLoss().to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=0.003,  # Higher initial learning rate
+        weight_decay=0.05,  # Stronger weight decay
+        betas=(0.9, 0.999)
+    )
+
+    # Learning rate scheduler
+    num_epochs = 100
+    warmup_epochs = 5
+    steps_per_epoch = len(train_loader)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=0.003,
+        epochs=num_epochs,
+        steps_per_epoch=steps_per_epoch,
+        pct_start=warmup_epochs/num_epochs,  # Warmup period
+        div_factor=10,  # Initial lr = max_lr/10
+        final_div_factor=100,  # Final lr = max_lr/1000
+        anneal_strategy='cos'
+    )
 
     # Train model
     logging.info("Starting training...")
@@ -238,9 +291,9 @@ def main():
         val_loader=val_loader,
         criterion=criterion,
         optimizer=optimizer,
-        scaler=scaler,
+        scheduler=scheduler,
         device=device,
-        num_epochs=100
+        num_epochs=num_epochs
     )
 
 if __name__ == '__main__':
