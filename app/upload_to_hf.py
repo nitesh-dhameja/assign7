@@ -53,12 +53,29 @@ def upload_to_huggingface(checkpoint_path, repo_id):
         "label2id": {f"LABEL_{i}": str(i) for i in range(1000)}
     }
     
+    # Create preprocessor config
+    preprocessor_config = {
+        "do_normalize": True,
+        "do_resize": True,
+        "image_mean": [0.485, 0.456, 0.406],
+        "image_processor_type": "AutoImageProcessor",
+        "image_std": [0.229, 0.224, 0.225],
+        "resample": 2,
+        "size": {
+            "height": 224,
+            "width": 224
+        }
+    }
+    
     # Save config and model
     os.makedirs("./temp_model", exist_ok=True)
     
-    # Save config
+    # Save configs
     with open("./temp_model/config.json", "w") as f:
         json.dump(config, f)
+    
+    with open("./temp_model/preprocessor_config.json", "w") as f:
+        json.dump(preprocessor_config, f)
     
     # Save model state
     torch.save(state_dict, "./temp_model/pytorch_model.bin")
@@ -118,6 +135,12 @@ The model was trained on the ImageNet dataset with the following configuration:
 - Learning Rate: 0.003 with cosine scheduling
 - Batch Size: 256
 - Data Augmentation: RandomResizedCrop, RandomHorizontalFlip, ColorJitter, RandomAffine, RandomPerspective
+
+## Preprocessing
+
+The model expects images to be preprocessed as follows:
+- Resize to 224x224
+- Normalize with mean [0.485, 0.456, 0.406] and std [0.229, 0.224, 0.225]
 """
     
     # Save model card
