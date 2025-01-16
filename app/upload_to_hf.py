@@ -151,8 +151,9 @@ def main():
     # Login to Hugging Face
     login(token=hf_token)
     
-    # Load model checkpoint (using absolute path)
-    checkpoint_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'checkpoints', 'best_model.pth')
+    # Load model checkpoint (using correct path)
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # Get assign9 directory
+    checkpoint_path = os.path.join(base_dir, 'checkpoints', 'best_model.pth')
     logging.info(f"Loading checkpoint from {checkpoint_path}")
     model, checkpoint = load_model_checkpoint(checkpoint_path)
     
