@@ -13,14 +13,45 @@ def load_model_checkpoint(checkpoint_path):
     """
     Load the trained model from checkpoint
     """
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path)
-    
-    # Initialize model
-    model = models.resnet50(weights=None)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
-    return model, checkpoint
+    try:
+        # Load checkpoint with weights_only=True for security
+        checkpoint = torch.load(checkpoint_path, weights_only=True)
+        
+        # Initialize model
+        model = models.resnet50(weights=None)
+        
+        # Handle different checkpoint formats
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+        elif 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        elif 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            # Assume the checkpoint itself is the state dict
+            state_dict = checkpoint
+        
+        # Load state dict
+        model.load_state_dict(state_dict)
+        
+        # Create a standardized checkpoint structure if missing fields
+        if not isinstance(checkpoint, dict):
+            checkpoint = {
+                'model_state_dict': state_dict,
+                'epoch': 0,
+                'best_acc': 0.0
+            }
+        elif 'epoch' not in checkpoint:
+            checkpoint['epoch'] = 0
+        elif 'best_acc' not in checkpoint:
+            checkpoint['best_acc'] = 0.0
+        
+        logging.info(f"Successfully loaded checkpoint with structure: {checkpoint.keys()}")
+        return model, checkpoint
+        
+    except Exception as e:
+        logging.error(f"Error loading checkpoint: {str(e)}")
+        raise
 
 def upload_to_huggingface(model, checkpoint, repo_id):
     """
@@ -120,8 +151,8 @@ def main():
     # Login to Hugging Face
     login(token=hf_token)
     
-    # Load model checkpoint
-    checkpoint_path = 'checkpoints/best_model.pth'
+    # Load model checkpoint (using absolute path)
+    checkpoint_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'checkpoints', 'best_model.pth')
     logging.info(f"Loading checkpoint from {checkpoint_path}")
     model, checkpoint = load_model_checkpoint(checkpoint_path)
     
