@@ -40,7 +40,7 @@ def upload_to_huggingface(checkpoint_path, repo_id):
     
     # Create config
     config = {
-        "model_type": "resnet",  # Specify model type
+        "model_type": "resnet",
         "architectures": ["ResNet50"],
         "hidden_size": 2048,
         "num_hidden_layers": 50,
@@ -53,17 +53,21 @@ def upload_to_huggingface(checkpoint_path, repo_id):
         "label2id": {f"LABEL_{i}": str(i) for i in range(1000)}
     }
     
-    # Create preprocessor config
-    preprocessor_config = {
+    # Create feature extractor config (previously preprocessor_config)
+    feature_extractor = {
+        "crop_size": {
+            "height": 224,
+            "width": 224
+        },
+        "do_center_crop": True,
         "do_normalize": True,
         "do_resize": True,
+        "feature_extractor_type": "ImageFeatureExtractor",
         "image_mean": [0.485, 0.456, 0.406],
-        "image_processor_type": "AutoImageProcessor",
         "image_std": [0.229, 0.224, 0.225],
         "resample": 2,
         "size": {
-            "height": 224,
-            "width": 224
+            "shortest_edge": 224
         }
     }
     
@@ -75,7 +79,7 @@ def upload_to_huggingface(checkpoint_path, repo_id):
         json.dump(config, f)
     
     with open("./temp_model/preprocessor_config.json", "w") as f:
-        json.dump(preprocessor_config, f)
+        json.dump(feature_extractor, f)
     
     # Save model state
     torch.save(state_dict, "./temp_model/pytorch_model.bin")
@@ -109,17 +113,17 @@ This model is a ResNet50 architecture trained on the ImageNet dataset for image 
 ## Usage
 
 ```python
-from transformers import AutoImageProcessor, AutoModelForImageClassification
+from transformers import AutoFeatureExtractor, AutoModelForImageClassification
 import torch
 from PIL import Image
 
-# Load model and processor
+# Load model and feature extractor
 model = AutoModelForImageClassification.from_pretrained("jatingocodeo/ImageNet")
-processor = AutoImageProcessor.from_pretrained("jatingocodeo/ImageNet")
+feature_extractor = AutoFeatureExtractor.from_pretrained("jatingocodeo/ImageNet")
 
 # Prepare image
 image = Image.open("path/to/image.jpg")
-inputs = processor(image, return_tensors="pt")
+inputs = feature_extractor(image, return_tensors="pt")
 
 # Get predictions
 with torch.no_grad():
@@ -139,7 +143,8 @@ The model was trained on the ImageNet dataset with the following configuration:
 ## Preprocessing
 
 The model expects images to be preprocessed as follows:
-- Resize to 224x224
+- Resize shortest edge to 224
+- Center crop to 224x224
 - Normalize with mean [0.485, 0.456, 0.406] and std [0.229, 0.224, 0.225]
 """
     
