@@ -4,8 +4,9 @@ import torchvision.transforms as transforms
 from PIL import Image
 import requests
 from io import BytesIO
-from transformers import AutoImageProcessor, AutoModelForImageClassification
 import json
+import torchvision.models as models
+from transformers import AutoImageProcessor
 
 # Load ImageNet class labels
 LABELS_URL = "https://raw.githubusercontent.com/anishathalye/imagenet-simple-labels/master/imagenet-simple-labels.json"
@@ -16,8 +17,21 @@ def load_model():
     """
     Load model and processor from Hugging Face Hub
     """
-    model_id = "jatingocodeo/ImageNet"  # Updated model repository ID
-    model = AutoModelForImageClassification.from_pretrained(model_id)
+    model_id = "jatingocodeo/ImageNet"
+    
+    # Initialize ResNet50 model
+    model = models.resnet50(weights=None)
+    model.fc = torch.nn.Linear(model.fc.in_features, 1000)  # 1000 ImageNet classes
+    
+    # Load model weights
+    checkpoint = torch.hub.load_state_dict_from_url(
+        f"https://huggingface.co/{model_id}/resolve/main/pytorch_model.bin",
+        map_location="cpu"
+    )
+    model.load_state_dict(checkpoint)
+    model.eval()
+    
+    # Create processor
     processor = AutoImageProcessor.from_pretrained(model_id)
     return model, processor
 
@@ -31,18 +45,16 @@ def predict(image):
     try:
         # Load model and processor (with caching)
         model, processor = load_model()
-        model.eval()
         
         # Process image
         inputs = processor(image, return_tensors="pt")
         
         # Get predictions
         with torch.no_grad():
-            outputs = model(**inputs)
-            logits = outputs.logits
+            outputs = model(inputs.pixel_values)
             
         # Get probabilities and classes
-        probs = torch.nn.functional.softmax(logits, dim=1)[0]
+        probs = torch.nn.functional.softmax(outputs, dim=1)[0]
         top_probs, top_indices = torch.topk(probs, k=5)
         
         # Format results
